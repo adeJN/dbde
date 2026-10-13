@@ -1,0 +1,18 @@
+# DBde workspace
+
+Applied with the ui-ux-pro-max skill to the existing React desktop client. The generated dark-mode/readability recommendations are retained; marketing sections, green CTAs, and remote font imports are inappropriate for this database workspace. Existing yellow accents and local system fonts remain the product rules.
+
+- The data grid is the primary working surface. Explorer table views start with SQL collapsed; opening the editor is an explicit, reversible action per tab.
+- A compact header identifies the connection, database and current table. Database selection, table refresh, SQL visibility and focus mode stay together above results.
+- Focus table hides the explorer, workspace heading and sandbox banner. Exiting focus restores the prior explorer preference. New tabs exit focus automatically.
+- SQL uses a compact 120–200px panel. Closing it unmounts Monaco to dispose its current editor and model; query text stays in workspace state.
+- Grid text is 12px monospace, header text 11px, rows 37px. Stable hover, sticky column headers and sticky selection checkboxes support scanning large results. All horizontal overflow stays within the table viewport.
+- Filter/copy/delete icons stay grouped in one toolbar row with accessible labels and tooltips. Add record and export remain visible. Selection retains the established yellow highlight; destructive actions retain their red treatment and confirmation.
+- Pagination stays anchored below the grid, with a row range, total count, page count, first/previous/next/last buttons and a labeled numeric rows-per-page textbox. It remains visible for small tables so users can change size. Defaults to 1,000; accepts any integer from 1 to 5,000, applied on Enter or blur, with inline validation and Escape to cancel. Loading disables navigation, size changes reset to the first page, and page changes clear selection. Controls wrap at narrow widths while data scroll stays inside the grid.
+- Global table filtering has a collapsible builder above the grid: column, named text/NULL operator, value, add/remove condition, explicit Apply/Cancel/Clear actions, and a sort selector. Conditions combine with AND and reset pagination to the first matching page. NULL operators disable the value input. Sorting can also cycle from a column header; it applies before pagination and uses primary keys to break ties. The builder scrolls within a bounded height so the table keeps its space. Page-only quick search remains separately labeled.
+- Double-clicking a cell opens a bounded record-detail dialog with editing for eligible cells. Adding a record uses Default/Value/NULL modes per column. Right-click opens a compact, keyboard-focusable context menu with grouped record, copy, filter, sort, export, and refresh actions; disabled actions explain unavailable operations through nearby context.
+- One focusable cell per grid uses a visible yellow focus ring. Arrow keys and Tab move focus, including into a distinct blank record row after the visible data; editing there is inline. Ctrl/⌘+Enter and the check button save its draft, while errors stay next to the row and preserve entered values. Keyboard help sits immediately above the grid.
+- Explorer can be hidden independently. At mobile widths it is an overlay, closed initially and after opening a table. Toolbar controls wrap instead of causing page overflow.
+- Visible keyboard focus, named icon buttons, expanded/pressed states, and reduced-motion support are required. The app currently provides a dark theme only.
+
+Verification: production build and React interaction tests. Direct screenshot review requires a connected browser/native UI surface, which was unavailable in this session.

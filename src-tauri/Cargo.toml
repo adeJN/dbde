@@ -1,0 +1,31 @@
+[package]
+name = "dbde"
+version = "0.1.0"
+description = "A lightweight local database workspace"
+edition = "2021"
+
+[lib]
+name = "dbde_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "sqlite", "chrono", "uuid", "json", "rust_decimal"] }
+tokio = { version = "1", features = ["sync", "time", "fs", "macros", "rt-multi-thread"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+futures-util = "0.3"
+chrono = "0.4"
+rust_decimal = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "s"
+panic = "abort"

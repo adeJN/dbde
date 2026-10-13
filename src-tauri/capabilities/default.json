@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "Main local database workspace",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
