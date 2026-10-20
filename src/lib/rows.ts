@@ -1,5 +1,6 @@
 import type { QueryResult } from "../types";
 import { spreadsheetText } from "./sql";
+import { keepEmptyLine } from "./grid";
 export function rowsAsTsv(columns: string[], rows: unknown[][]): string {
   return [columns, ...rows]
     .map((row) =>
@@ -12,6 +13,7 @@ export function rowsAsTsv(columns: string[], rows: unknown[][]): string {
         })
         .join("\t"),
     )
+    .map(keepEmptyLine)
     .join("\r\n");
 }
 export function rowKeys(

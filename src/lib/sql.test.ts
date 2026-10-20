@@ -85,3 +85,108 @@ describe("workspace lifetime", () => {
     expect(useWorkspace.getState().tabs).toHaveLength(0);
   });
 });
+describe("destructive SQL detection", () => {
+  it("flags unfiltered writes and drops but not filtered or quoted ones", async () => {
+    const { destructiveStatements } = await import("./sql");
+    expect(
+      destructiveStatements(
+        "DELETE FROM a; DELETE FROM b WHERE id = 1; update c set x = 1;\nDROP TABLE d; TRUNCATE e; ALTER TABLE f DROP COLUMN g; ALTER TABLE h ADD COLUMN i int",
+        "postgres",
+      ),
+    ).toEqual([
+      "DELETE FROM a",
+      "update c set x = 1",
+      "DROP TABLE d",
+      "TRUNCATE e",
+      "ALTER TABLE f DROP COLUMN g",
+    ]);
+    // Keywords and semicolons inside strings, identifiers and comments do not count.
+    expect(
+      destructiveStatements(
+        "SELECT 'x; DROP TABLE y'; -- DELETE FROM z\nUPDATE t SET note = 'no where here' WHERE id = 2; /* TRUNCATE q; */ SELECT \"; drop\" FROM w",
+        "postgres",
+      ),
+    ).toEqual([]);
+    expect(
+      destructiveStatements("SELECT $$; DROP TABLE x;$$", "postgres"),
+    ).toEqual([]);
+    expect(
+      destructiveStatements(
+        "SELECT 'it\\'s; DROP TABLE x'; # DELETE FROM y\nSELECT 1",
+        "mysql",
+      ),
+    ).toEqual([]);
+  });
+  it("builds table actions with quoted names and the SQLite truncate form", async () => {
+    const { tableActionSql, completionIdentifier } = await import("./sql");
+    const table = { name: 'Odd"Name', schema: "app", kind: "table" };
+    expect(tableActionSql("drop", table, "postgres")).toBe(
+      'DROP TABLE "app"."Odd""Name";',
+    );
+    expect(tableActionSql("truncate", table, "mysql")).toBe(
+      'TRUNCATE TABLE `app`.`Odd"Name`;',
+    );
+    expect(tableActionSql("truncate", { ...table, schema: "" }, "sqlite")).toBe(
+      'DELETE FROM "Odd""Name";',
+    );
+    expect(
+      tableActionSql("drop", { ...table, kind: "view" }, "postgres"),
+    ).toMatch(/^DROP VIEW /);
+    expect(completionIdentifier("orders", "postgres")).toBe("orders");
+    expect(completionIdentifier("Orders", "postgres")).toBe('"Orders"');
+    expect(completionIdentifier("Orders", "mysql")).toBe("Orders");
+    expect(completionIdentifier("order items", "mysql")).toBe("`order items`");
+  });
+});
+it("detects destructive CTE writes and ignores WHERE clauses in nested queries", async () => {
+  const { destructiveStatements } = await import("./sql");
+  for (const query of [
+    "WITH c AS (SELECT 1 WHERE true) DELETE FROM users;",
+    "WITH c AS (SELECT 1) UPDATE users SET name = 'x';",
+    "WITH c AS (DELETE FROM users RETURNING id) SELECT * FROM c;",
+    "UPDATE users SET name = (SELECT name FROM source WHERE id = 1);",
+  ])
+    expect(destructiveStatements(query, "postgres")).toHaveLength(1);
+  expect(
+    destructiveStatements(
+      "WITH c AS (SELECT 1) DELETE FROM users WHERE id IN (SELECT * FROM c)",
+      "postgres",
+    ),
+  ).toEqual([]);
+});
+describe("renaming tables", () => {
+  it("validates new names per database and catches clashes", async () => {
+    const { tableNameError } = await import("./sql");
+    const table = { name: "users", schema: "app", kind: "table" };
+    const existing = [table, { name: "Orders", schema: "app", kind: "table" }];
+    expect(tableNameError(table, "", "mysql")).toMatch(/Enter a name/);
+    expect(tableNameError(table, " users2", "mysql")).toMatch(/spaces/);
+    expect(tableNameError(table, "users", "mysql")).toMatch(/different/);
+    expect(tableNameError(table, "x".repeat(65), "mysql")).toMatch(/64/);
+    expect(tableNameError(table, "é".repeat(32), "postgres")).toMatch(
+      /63 bytes/,
+    );
+    expect(tableNameError(table, "orders", "mysql", existing)).toMatch(
+      /exists/,
+    );
+    // PostgreSQL names are case-sensitive once quoted.
+    expect(tableNameError(table, "orders", "postgres", existing)).toBe("");
+    expect(tableNameError({ ...table, kind: "view" }, "v2", "sqlite")).toMatch(
+      /cannot rename a view/,
+    );
+    expect(tableNameError(table, "members", "sqlite", existing)).toBe("");
+  });
+  it("previews the statement the backend runs", async () => {
+    const { renameTableSql } = await import("./sql");
+    const table = { name: "old`name", schema: "app", kind: "table" };
+    expect(renameTableSql(table, "new", "mysql")).toBe(
+      "RENAME TABLE `app`.`old``name` TO `app`.`new`;",
+    );
+    expect(renameTableSql({ ...table, kind: "view" }, 'N"ew', "postgres")).toBe(
+      'ALTER VIEW "app"."old`name" RENAME TO "N""ew";',
+    );
+    expect(renameTableSql({ ...table, schema: "" }, "new", "sqlite")).toBe(
+      'ALTER TABLE "old`name" RENAME TO "new";',
+    );
+  });
+});

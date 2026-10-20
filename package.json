@@ -1,6 +1,6 @@
 {
   "name": "dbde",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,9 +8,11 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=2",
     "format": "prettier --write src vite.config.ts tsconfig.json package.json index.html src-tauri/tauri.conf.json src-tauri/capabilities/default.json README.md",
-    "format:check": "prettier --check src vite.config.ts tsconfig.json package.json index.html src-tauri/tauri.conf.json src-tauri/capabilities/default.json README.md"
+    "format:check": "prettier --check src vite.config.ts tsconfig.json package.json index.html src-tauri/tauri.conf.json src-tauri/capabilities/default.json README.md",
+    "release:build": "node scripts/release-build.mjs",
+    "updater:manifest": "node scripts/update-manifest.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

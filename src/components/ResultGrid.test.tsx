@@ -13,8 +13,9 @@ import type { QueryResult } from "../types";
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
     getTotalSize: () => count * 37,
+    // Like the real virtualizer, render only a window of rows, not all 1,000+.
     getVirtualItems: () =>
-      Array.from({ length: count }, (_, index) => ({
+      Array.from({ length: Math.min(count, 40) }, (_, index) => ({
         index,
         key: index,
         start: index * 37,
@@ -53,8 +54,8 @@ beforeEach(() => {
 afterEach(cleanup);
 describe("row actions", () => {
   it("moves through cells with the keyboard and saves a record from the blank bottom row", async () => {
-    const onInsertRecord = vi.fn().mockResolvedValue(1);
-    render(<ResultGrid result={result} onInsertRecord={onInsertRecord} />);
+    const onApplyChanges = vi.fn().mockResolvedValue(1);
+    render(<ResultGrid result={result} onApplyChanges={onApplyChanges} />);
     const beta = screen.getByRole("cell", { name: "Beta" });
     beta.focus();
     fireEvent.keyDown(beta, { key: "ArrowDown" });
@@ -64,16 +65,23 @@ describe("row actions", () => {
     const input = screen.getByRole("textbox", { name: "New record name" });
     fireEvent.change(input, { target: { value: "New person" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    await waitFor(() => expect(newName.textContent).toBe("New person"));
-    fireEvent.keyDown(newName, { key: "Enter", ctrlKey: true });
     await waitFor(() =>
-      expect(onInsertRecord).toHaveBeenCalledWith({ name: "New person" }),
+      expect(onApplyChanges).toHaveBeenCalledWith([
+        { kind: "insert", values: { name: "New person" } },
+      ]),
     );
-    await waitFor(() => expect(newName.textContent).toBe(""));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("cell", { name: "New record, name" }),
+      ),
+    );
+    expect(
+      screen.getByRole("cell", { name: "New record, name" }).textContent,
+    ).toBe("");
   });
   it("supports horizontal arrows and Tab without adding a row to custom query results", async () => {
     const { rerender } = render(
-      <ResultGrid result={result} onInsertRecord={vi.fn()} />,
+      <ResultGrid result={result} onApplyChanges={vi.fn()} />,
     );
     const zeta = screen.getByRole("cell", { name: "Zeta" });
     zeta.focus();
@@ -89,13 +97,13 @@ describe("row actions", () => {
     expect(screen.queryByRole("row", { name: "New record" })).toBeNull();
   });
   it("keeps a failed new-record draft so it can be corrected", async () => {
-    const onInsertRecord = vi
+    const onApplyChanges = vi
       .fn()
       .mockRejectedValue(new Error("Required field missing"));
     render(
       <ResultGrid
         result={{ ...result, rows: [] }}
-        onInsertRecord={onInsertRecord}
+        onApplyChanges={onApplyChanges}
       />,
     );
     const newName = screen.getByRole("cell", { name: "New record, name" });
@@ -122,16 +130,14 @@ describe("row actions", () => {
   });
   it("sorts structured tables and exposes record actions on double-click and right-click", async () => {
     const onSortChange = vi.fn();
-    const onUpdateCell = vi.fn().mockResolvedValue(1);
-    const onInsertRecord = vi.fn().mockResolvedValue(1);
+    const onApplyChanges = vi.fn().mockResolvedValue(1);
     const onRefresh = vi.fn();
     const onFilterApply = vi.fn();
     render(
       <ResultGrid
         result={result}
         onSortChange={onSortChange}
-        onUpdateCell={onUpdateCell}
-        onInsertRecord={onInsertRecord}
+        onApplyChanges={onApplyChanges}
         onRefresh={onRefresh}
         onFilterApply={onFilterApply}
         onDelete={vi.fn()}
@@ -143,19 +149,20 @@ describe("row actions", () => {
       direction: "asc",
     });
     fireEvent.doubleClick(screen.getByRole("cell", { name: "Zeta" }));
-    expect(screen.getByText("Record details")).toBeTruthy();
-    fireEvent.change(screen.getByRole("textbox", { name: "Edit name" }), {
-      target: { value: "Zeta new" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
+    const inline = screen.getByRole("textbox", { name: "Edit name in cell" });
+    fireEvent.change(inline, { target: { value: "Zeta new" } });
+    fireEvent.keyDown(inline, { key: "Enter" });
+    // Enter moves to the next record, which saves the edited one.
     await waitFor(() =>
-      expect(onUpdateCell).toHaveBeenCalledWith(
-        [2, "Zeta"],
-        "name",
-        "Zeta new",
-      ),
+      expect(onApplyChanges).toHaveBeenCalledWith([
+        { kind: "update", key: { id: 2 }, values: { name: "Zeta new" } },
+      ]),
     );
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("textbox", { name: "Edit name in cell" }),
+      ).toBeNull(),
+    );
     fireEvent.contextMenu(screen.getByRole("cell", { name: "Zeta" }), {
       clientX: 40,
       clientY: 50,
@@ -185,24 +192,16 @@ describe("row actions", () => {
       clientY: 50,
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Paste" }));
+    const pasted = (await screen.findByRole("textbox", {
+      name: "Edit name in cell",
+    })) as HTMLInputElement;
+    expect(pasted.value).toBe("Pasted name");
+    fireEvent.keyDown(pasted, { key: "Enter" });
     await waitFor(() =>
-      expect(
-        (
-          screen.getByRole("textbox", {
-            name: "Edit name",
-          }) as HTMLTextAreaElement
-        ).value,
-      ).toBe("Pasted name"),
+      expect(onApplyChanges).toHaveBeenLastCalledWith([
+        { kind: "update", key: { id: 2 }, values: { name: "Pasted name" } },
+      ]),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Save cell" }));
-    await waitFor(() =>
-      expect(onUpdateCell).toHaveBeenLastCalledWith(
-        [2, "Zeta"],
-        "name",
-        "Pasted name",
-      ),
-    );
-    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     fireEvent.click(screen.getByRole("button", { name: "Add record" }));
     fireEvent.change(screen.getByRole("combobox", { name: "name mode" }), {
       target: { value: "value" },
@@ -216,18 +215,30 @@ describe("row actions", () => {
       }),
     );
     await waitFor(() =>
-      expect(onInsertRecord).toHaveBeenCalledWith({ name: "New person" }),
+      expect(onApplyChanges).toHaveBeenLastCalledWith([
+        { kind: "insert", values: { name: "New person" } },
+      ]),
     );
   });
-  it("groups icon-only filter, copy, and delete actions in one toolbar row", () => {
+  it("keeps icon-only record and filter actions in functional groups in the same toolbar", () => {
     render(<ResultGrid result={result} onFilterApply={vi.fn()} />);
     const filter = screen.getByRole("button", { name: "Filters" });
     const copy = screen.getByRole("button", { name: "Copy selected rows" });
     const remove = screen.getByRole("button", { name: "Delete selected rows" });
-    const group = filter.parentElement;
-    expect(group?.classList.contains("row-actions")).toBe(true);
-    expect(copy.parentElement).toBe(group);
-    expect(remove.parentElement).toBe(group);
+    const records = screen.getByRole("group", { name: "Record actions" });
+    const search = screen.getByRole("group", { name: "Filters and search" });
+    expect(
+      within(records).getByRole("button", { name: "Copy selected rows" }),
+    ).toBe(copy);
+    expect(
+      within(records).getByRole("button", { name: "Delete selected rows" }),
+    ).toBe(remove);
+    expect(within(search).getByRole("button", { name: "Filters" })).toBe(
+      filter,
+    );
+    expect(records.closest(".result-toolbar")).toBe(
+      search.closest(".result-toolbar"),
+    );
     expect(filter.textContent).toBe("");
     expect(copy.textContent).toBe("");
     expect(remove.textContent).toBe("");
@@ -431,4 +442,120 @@ describe("row actions", () => {
       ).toContain("Permission denied"),
     );
   });
+});
+
+it("loads quick-mode record details on demand and keeps mutations disabled", async () => {
+  const onLoadRecord = vi.fn().mockResolvedValue([1, { hex: "00ff" }]);
+  const onApplyChanges = vi.fn();
+  const quick: QueryResult = {
+    ...result,
+    columns: ["id", "payload"],
+    rows: [[1, { deferred: true }]],
+    source: { ...result.source!, quick: true },
+  };
+  render(
+    <ResultGrid
+      result={quick}
+      onLoadRecord={onLoadRecord}
+      onApplyChanges={onApplyChanges}
+    />,
+  );
+  expect(onLoadRecord).not.toHaveBeenCalled();
+  fireEvent.keyDown(screen.getByRole("cell", { name: "1" }), {
+    key: "s",
+    ctrlKey: true,
+  });
+  await waitFor(() =>
+    expect(screen.getByText(/This table view is read-only/)).toBeTruthy(),
+  );
+  expect(onApplyChanges).not.toHaveBeenCalled();
+  expect(screen.queryByRole("row", { name: "New record" })).toBeNull();
+  fireEvent.doubleClick(
+    screen.getByRole("cell", { name: "BLOB · double-click to load" }),
+  );
+  await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+  expect(onLoadRecord).toHaveBeenCalledWith(quick.rows[0]);
+  expect(screen.getByText('{"hex":"00ff"}')).toBeTruthy();
+  expect(onApplyChanges).not.toHaveBeenCalled();
+});
+it("offers column-specific sorting on right-click and preserves the cell menu", () => {
+  const onSortChange = vi.fn();
+  render(
+    <ResultGrid
+      result={result}
+      onSortChange={onSortChange}
+      onFilterApply={vi.fn()}
+    />,
+  );
+  const header = screen.getByRole("columnheader", { name: "name" });
+  expect(fireEvent.contextMenu(header)).toBe(false);
+  expect(
+    screen.getByRole("menu", { name: "name column actions" }),
+  ).toBeTruthy();
+  fireEvent.click(screen.getByRole("menuitem", { name: "Sort Descending" }));
+  expect(onSortChange).toHaveBeenCalledWith({
+    column: "name",
+    direction: "desc",
+  });
+  fireEvent.contextMenu(screen.getByRole("cell", { name: "Alpha" }));
+  expect(
+    screen.queryByRole("menu", { name: "name column actions" }),
+  ).toBeNull();
+  expect(screen.getByRole("menuitem", { name: "Copy" })).toBeTruthy();
+});
+
+it("keeps content-sized headers, records and the new-record row aligned while filtering", () => {
+  const { container } = render(
+    <ResultGrid
+      result={{
+        ...result,
+        rows: [
+          [1, "x".repeat(200)],
+          [2, "Short"],
+        ],
+      }}
+      onApplyChanges={vi.fn()}
+    />,
+  );
+  const header = container.querySelector<HTMLElement>(".grid-head")!;
+  const template = header.style.gridTemplateColumns;
+  expect(template).toBe("34px 48px 96px 300px");
+  for (const row of container.querySelectorAll<HTMLElement>(".grid-row")) {
+    expect(row.style.gridTemplateColumns).toBe(template);
+  }
+  expect(
+    container.querySelector<HTMLElement>(".grid-new-row")!.style.minWidth,
+  ).toBe(header.style.minWidth);
+  fireEvent.change(screen.getByRole("textbox", { name: "Filter results" }), {
+    target: { value: "Short" },
+  });
+  expect(header.style.gridTemplateColumns).toBe(template);
+});
+
+it("resizes the header and every record without triggering sort, and double-click restores auto width", () => {
+  const onSortChange = vi.fn();
+  const { container } = render(
+    <ResultGrid
+      result={result}
+      onApplyChanges={vi.fn()}
+      onSortChange={onSortChange}
+    />,
+  );
+  const handle = screen.getByRole("separator", { name: "Resize name column" });
+  const initial = Number(handle.getAttribute("aria-valuenow"));
+  fireEvent(
+    handle,
+    new MouseEvent("pointerdown", { bubbles: true, button: 0, clientX: 100 }),
+  );
+  fireEvent(window, new MouseEvent("pointermove", { clientX: 140 }));
+  fireEvent(window, new MouseEvent("pointerup"));
+  expect(handle.getAttribute("aria-valuenow")).toBe(String(initial + 40));
+  const template =
+    container.querySelector<HTMLElement>(".grid-head")!.style
+      .gridTemplateColumns;
+  for (const row of container.querySelectorAll<HTMLElement>(".grid-row"))
+    expect(row.style.gridTemplateColumns).toBe(template);
+  expect(onSortChange).not.toHaveBeenCalled();
+  fireEvent.doubleClick(handle);
+  expect(handle.getAttribute("aria-valuenow")).toBe(String(initial));
 });

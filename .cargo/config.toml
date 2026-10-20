@@ -1,0 +1,4 @@
+# Keep local development/test artifacts smaller. Release settings remain in Cargo.toml.
+[profile.dev]
+debug = 0
+incremental = false

@@ -1,0 +1,7 @@
+-> Sort: `sum(o.total)` DESC  (actual time=3.21..3.22 rows=49 loops=1)
+    -> Table scan on <temporary>  (actual time=3.10..3.13 rows=49 loops=1)
+        -> Aggregate using temporary table  (actual time=3.09..3.09 rows=49 loops=1)
+            -> Nested loop inner join  (cost=685.00 rows=1665) (actual time=0.10..2.50 rows=245 loops=1)
+                -> Filter: (c.id < 50)  (cost=102.25 rows=333) (actual time=0.05..0.40 rows=49 loops=1)
+                    -> Table scan on c  (cost=102.25 rows=1000) (actual time=0.04..0.30 rows=1000 loops=1)
+                -> Index lookup on o using o_c (c_id=c.id)  (cost=1.25 rows=5) (actual time=0.02..0.04 rows=5 loops=49)

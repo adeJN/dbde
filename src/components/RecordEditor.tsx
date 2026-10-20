@@ -48,7 +48,6 @@ export default function RecordEditor({
   const editable =
     !!target &&
     canEdit &&
-    !primaryKeys.includes(target.column) &&
     (target.row[target.index] == null ||
       typeof target.row[target.index] !== "object");
   async function save() {
@@ -138,7 +137,7 @@ export default function RecordEditor({
                 onChange={(event) => setValue(event.target.value)}
               />
             </label>
-            {editable && (
+            {editable && !primaryKeys.includes(target.column) && (
               <label className="record-null">
                 <input
                   type="checkbox"
@@ -151,8 +150,8 @@ export default function RecordEditor({
             )}
             {!editable && (
               <p className="record-note">
-                This cell is read-only. Only non-key scalar values in tables
-                with a primary key can be edited.
+                This cell is read-only. Only scalar values in editable tables
+                with a primary key can be changed.
               </p>
             )}
           </>

@@ -1,6 +1,6 @@
 [package]
 name = "dbde"
-version = "0.1.0"
+version = "0.2.0"
 description = "A lightweight local database workspace"
 edition = "2021"
 
@@ -16,12 +16,25 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "mysql", "sqlite", "chrono", "uuid", "json", "rust_decimal"] }
-tokio = { version = "1", features = ["sync", "time", "fs", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "time", "fs", "macros", "rt-multi-thread", "net", "io-util"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 futures-util = "0.3"
 chrono = "0.4"
 rust_decimal = "1"
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+# Streaming .xlsx export; constant_memory flushes each row to a temp file instead of RAM.
+rust_xlsxwriter = { version = "0.99.1", default-features = false, features = ["constant_memory"] }
+# Import wizard: streaming CSV/TSV parsing and .xlsx/.xls reading.
+csv = "1.4"
+calamine = "0.36"
+russh = { version = "0.54", default-features = false, features = ["ring", "rsa"] }
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Reads exported .xlsx files back in tests (already a rust_xlsxwriter dependency).
+zip = { version = "8.3", default-features = false, features = ["deflate"] }
 
 [profile.release]
 strip = true

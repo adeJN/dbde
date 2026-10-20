@@ -103,3 +103,42 @@ describe("pagination controls", () => {
     ).toBe(true);
   });
 });
+it("can navigate beyond an underestimated count and stops at the actual end", () => {
+  const onChange = vi.fn();
+  const { rerender } = render(
+    <Pagination
+      page={1000}
+      pageSize={1000}
+      totalRows={1000000}
+      rowCount={1000}
+      estimated
+      busy={false}
+      onChange={onChange}
+    />,
+  );
+  expect(
+    (screen.getByRole("button", { name: "Next page" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Next page" }));
+  expect(onChange).toHaveBeenCalledWith(1001, 1000);
+  expect(
+    (screen.getByRole("button", { name: "Last page" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+  rerender(
+    <Pagination
+      page={1001}
+      pageSize={1000}
+      totalRows={1000000}
+      rowCount={205}
+      estimated
+      busy={false}
+      onChange={onChange}
+    />,
+  );
+  expect(
+    (screen.getByRole("button", { name: "Next page" }) as HTMLButtonElement)
+      .disabled,
+  ).toBe(true);
+});

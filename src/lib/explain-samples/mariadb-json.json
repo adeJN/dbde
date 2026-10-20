@@ -1,0 +1,29 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "filesort": {
+      "sort_key": "sum(o.total) desc",
+      "temporary_table": {
+        "table": {
+          "table_name": "c",
+          "access_type": "ALL",
+          "possible_keys": ["PRIMARY"],
+          "rows": 646,
+          "filtered": 100,
+          "attached_condition": "c.`id` < 50 or c.`name` like 'n9%'"
+        },
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": ["o_c"],
+          "key": "o_c",
+          "key_length": "5",
+          "used_key_parts": ["c_id"],
+          "ref": ["test.c.id"],
+          "rows": 2,
+          "filtered": 100
+        }
+      }
+    }
+  }
+}

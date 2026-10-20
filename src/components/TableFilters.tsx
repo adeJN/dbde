@@ -66,10 +66,27 @@ export default function TableFilters({
         }}
       >
         <fieldset disabled={busy}>
-          <legend>Match all conditions (AND)</legend>
+          <legend>
+            {draft.some((filter, index) => index > 0 && filter.join === "or")
+              ? "Filter conditions (AND / OR)"
+              : "Match all conditions (AND)"}
+          </legend>
           {draft.map((filter, index) => (
             <div className="filter-condition" key={index}>
-              <span>{index === 0 ? "Where" : "And"}</span>
+              {index === 0 ? (
+                <span>Where</span>
+              ) : (
+                <select
+                  aria-label={`Filter connector ${index + 1}`}
+                  value={filter.join ?? "and"}
+                  onChange={(event) =>
+                    change(index, { join: event.target.value as "and" | "or" })
+                  }
+                >
+                  <option value="and">AND</option>
+                  <option value="or">OR</option>
+                </select>
+              )}
               <select
                 aria-label={`Filter column ${index + 1}`}
                 value={filter.column}
@@ -129,7 +146,10 @@ export default function TableFilters({
             >
               <Plus size={13} /> Add condition
             </button>
-            <span>Text matching · % and _ are literal characters</span>
+            <span>
+              Text matching · % and _ are literal characters · AND is evaluated
+              before OR
+            </span>
             {applied.length > 0 && (
               <button
                 type="button"

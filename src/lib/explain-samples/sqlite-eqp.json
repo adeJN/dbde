@@ -1,0 +1,13 @@
+{
+  "sqlite_version": "3.51.0",
+  "sql": "EXPLAIN QUERY PLAN SELECT c.name, (SELECT max(total) FROM orders) AS m, sum(o.total) FROM customers c JOIN orders o ON o.customer_id = c.id WHERE c.email LIKE '%x' GROUP BY c.name ORDER BY 3 DESC",
+  "columns": ["id", "parent", "notused", "detail"],
+  "rows": [
+    [8, 0, 216, "SCAN o"],
+    [10, 0, 45, "SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"],
+    [16, 0, 0, "USE TEMP B-TREE FOR GROUP BY"],
+    [50, 0, 0, "SCALAR SUBQUERY 1"],
+    [55, 50, 216, "SEARCH orders"],
+    [74, 0, 0, "USE TEMP B-TREE FOR ORDER BY"]
+  ]
+}

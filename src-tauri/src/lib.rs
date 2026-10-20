@@ -11,13 +11,31 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
+mod column_meta;
+mod connection_options;
+mod database_actions;
+mod explain;
+mod export;
+mod import;
+mod maintain;
+mod objects;
+mod query_library;
 mod rows;
+mod schema;
+mod ssh_tunnel;
+mod table_actions;
+mod table_alter;
+mod table_designer;
+mod table_rename;
+mod updates;
+mod windows;
 
 const MAX_ROWS: usize = 50_000;
 const DEADLINE: Duration = Duration::from_secs(30);
+const MAX_QUERY_TIMEOUT_SECS: u64 = 3600;
 const MAX_SESSIONS: usize = 16;
 type DbResult<T> = Result<T, String>;
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Driver {
     Postgres,
@@ -26,6 +44,8 @@ enum Driver {
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct ConnectionConfig {
+    #[serde(default)]
+    options: connection_options::ConnectionOptions,
     id: String,
     name: String,
     driver: Driver,
@@ -35,6 +55,8 @@ struct ConnectionConfig {
     #[serde(default, skip_serializing)]
     password: Option<String>,
     database: String,
+    #[serde(default)]
+    database_only: bool,
     ssl_mode: String,
     file_path: String,
 }
@@ -54,9 +76,15 @@ struct Session {
     conn: SessionConn,
     database: String,
 }
-type SessionSlot = Arc<Mutex<Option<Session>>>;
+struct SessionState {
+    session: Mutex<Option<Session>>,
+    // pg_backend_pid() or CONNECTION_ID(), read without waiting for a running query.
+    server_id: std::sync::Mutex<Option<u64>>,
+}
+type SessionSlot = Arc<SessionState>;
 #[derive(Clone)]
 struct Connection {
+    tunnel: Option<Arc<ssh_tunnel::Tunnel>>,
     pool: Pool,
     config: ConnectionConfig,
     databases: Arc<Mutex<HashMap<String, Pool>>>,
@@ -77,12 +105,49 @@ struct TableInfo {
 struct SchemaTree {
     database: String,
     tables: Vec<TableInfo>,
+    table_metadata: Vec<TableMetadata>,
+}
+#[derive(Serialize)]
+struct TableMetadata {
+    name: String,
+    schema: String,
+    rows: Option<u64>,
+    data_length: Option<u64>,
+    engine: Option<String>,
+    created_date: Option<String>,
+    modified_date: Option<String>,
+    collation: Option<String>,
+    comment: Option<String>,
+}
+fn table_metadata(row: &[Value]) -> TableMetadata {
+    let text = |index: usize| row.get(index).and_then(Value::as_str).map(str::to_owned);
+    let number = |index: usize| row.get(index).and_then(Value::as_u64);
+    TableMetadata {
+        name: text(0).unwrap_or_default(),
+        schema: text(1).unwrap_or_default(),
+        rows: number(3),
+        data_length: number(4),
+        engine: text(5),
+        created_date: text(6),
+        modified_date: text(7),
+        collation: text(8),
+        comment: text(9),
+    }
 }
 #[derive(Serialize)]
 struct ColumnInfo {
     name: String,
     data_type: String,
     nullable: bool,
+    /// Allowed values of a MySQL/MariaDB ENUM or a PostgreSQL enum type, in order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enum_values: Option<Vec<String>>,
+    /// Members of a MySQL/MariaDB SET column, in definition order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    set_values: Option<Vec<String>>,
+    /// PostgreSQL boolean, MySQL BOOL (tinyint(1)) or SQLite BOOLEAN.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    is_boolean: bool,
 }
 #[derive(Serialize)]
 struct QueryResult {
@@ -117,9 +182,16 @@ fn validate(config: &ConnectionConfig) -> DbResult<()> {
         }
         _ => (),
     }
+    if config.database_only
+        && !matches!(config.driver, Driver::Sqlite)
+        && config.database.trim().is_empty()
+    {
+        return Err("A database name is required for a focused connection".into());
+    }
     if !["disable", "require", "verify-full"].contains(&config.ssl_mode.as_str()) {
         return Err("Invalid SSL mode".into());
     }
+    config.options.validate(config)?;
     Ok(())
 }
 fn safe_error(error: impl std::fmt::Display, password: &str) -> String {
@@ -130,9 +202,31 @@ fn safe_error(error: impl std::fmt::Display, password: &str) -> String {
         message.replace(password, "[redacted]")
     }
 }
-async fn password(config: &ConnectionConfig) -> DbResult<String> {
+fn same_server(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
+    a.driver == b.driver
+        && a.host == b.host
+        && a.port == b.port
+        && a.username == b.username
+        && a.options.socket_path == b.options.socket_path
+        && a.options.ssh.same_endpoint(&b.options.ssh)
+}
+// The IPC payload comes from the webview. A stored secret is only released for the exact
+// server it was saved with, so a compromised page cannot redirect it to another host.
+async fn saved_profile_matches(state: &AppState, config: &ConnectionConfig) -> DbResult<bool> {
+    let _guard = state.profiles.lock().await;
+    Ok(read_profiles(state)
+        .await?
+        .iter()
+        .any(|saved| saved.id == config.id && same_server(saved, config)))
+}
+async fn password(config: &ConnectionConfig, state: &AppState) -> DbResult<String> {
     if let Some(password) = &config.password {
         return Ok(password.clone());
+    }
+    if !saved_profile_matches(state, config).await? {
+        return Err(
+            "Enter the password. These connection details do not match a saved profile.".into(),
+        );
     }
     let id = config.id.clone();
     tokio::task::spawn_blocking(move || {
@@ -148,23 +242,33 @@ async fn password(config: &ConnectionConfig) -> DbResult<String> {
     .await
     .map_err(err)?
 }
-async fn make_pool(config: &ConnectionConfig) -> DbResult<Pool> {
+async fn make_pool(
+    config: &ConnectionConfig,
+    state: &AppState,
+) -> DbResult<(Pool, Option<Arc<ssh_tunnel::Tunnel>>)> {
     validate(config)?;
+    let tunnel = ssh_tunnel::open(config, state).await?;
+    let pool = make_pool_at(config, state, tunnel.as_deref()).await?;
+    Ok((pool, tunnel))
+}
+async fn make_pool_at(
+    config: &ConnectionConfig,
+    state: &AppState,
+    tunnel: Option<&ssh_tunnel::Tunnel>,
+) -> DbResult<Pool> {
     if let Driver::Sqlite = config.driver {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(&config.file_path)
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
-        return sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .acquire_timeout(Duration::from_secs(10))
+        return connection_options::lite_pool(config)
             .connect_with(options)
             .await
             .map(Pool::Lite)
             .map_err(err);
     }
-    let secret = password(config).await?;
+    let secret = password(config, state).await?;
     match config.driver {
         Driver::Postgres => {
             let ssl = match config.ssl_mode.as_str() {
@@ -183,11 +287,18 @@ async fn make_pool(config: &ConnectionConfig) -> DbResult<Pool> {
             } else {
                 &config.database
             });
-            sqlx::postgres::PgPoolOptions::new()
-                .max_connections(3)
-                .min_connections(0)
-                .acquire_timeout(Duration::from_secs(10))
-                .idle_timeout(Duration::from_secs(60))
+            let mut options = options;
+            if !config.options.ssl_ca.is_empty() {
+                options = options.ssl_root_cert(&config.options.ssl_ca);
+            }
+            if !config.options.ssl_cert.is_empty() {
+                options = options.ssl_client_cert(&config.options.ssl_cert);
+            }
+            if !config.options.ssl_key.is_empty() {
+                options = options.ssl_client_key(&config.options.ssl_key);
+            }
+            let options = tunnel.map_or_else(|| options.clone(), |t| t.pg_options(options.clone()));
+            connection_options::pg_pool(config)
                 .connect_with(options)
                 .await
                 .map(Pool::Pg)
@@ -213,11 +324,24 @@ async fn make_pool(config: &ConnectionConfig) -> DbResult<Pool> {
             } else {
                 options.database(&config.database)
             };
-            sqlx::mysql::MySqlPoolOptions::new()
-                .max_connections(3)
-                .min_connections(0)
-                .acquire_timeout(Duration::from_secs(10))
-                .idle_timeout(Duration::from_secs(60))
+            let mut options = options;
+            if !config.options.charset.is_empty() {
+                options = options.charset(&config.options.charset);
+            }
+            if !config.options.socket_path.is_empty() {
+                options = options.socket(&config.options.socket_path);
+            }
+            if !config.options.ssl_ca.is_empty() {
+                options = options.ssl_ca(&config.options.ssl_ca);
+            }
+            if !config.options.ssl_cert.is_empty() {
+                options = options.ssl_client_cert(&config.options.ssl_cert);
+            }
+            if !config.options.ssl_key.is_empty() {
+                options = options.ssl_client_key(&config.options.ssl_key);
+            }
+            let options = tunnel.map_or_else(|| options.clone(), |t| t.my_options(options.clone()));
+            connection_options::my_pool(config)
                 .connect_with(options)
                 .await
                 .map(Pool::My)
@@ -265,19 +389,15 @@ async fn database_connection(
     if matches!(conn.pool, Pool::Lite(_)) || conn.config.database == database {
         return Ok(conn);
     }
-    let pool = {
-        let mut pools = conn.databases.lock().await;
-        if let Some(pool) = pools.get(database) {
-            pool.clone()
-        } else {
+    let existing = conn.databases.lock().await.get(database).cloned();
+    let pool = match existing {
+        Some(pool) => pool,
+        None => {
+            // Connect without holding the map lock so other tabs are not blocked meanwhile.
             let pool = match &conn.pool {
                 Pool::Pg(p) => {
                     let options = p.connect_options().as_ref().clone().database(database);
-                    sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(2)
-                        .min_connections(0)
-                        .acquire_timeout(Duration::from_secs(10))
-                        .idle_timeout(Duration::from_secs(60))
+                    connection_options::pg_pool(&conn.config)
                         .connect_with(options)
                         .await
                         .map(Pool::Pg)
@@ -285,11 +405,7 @@ async fn database_connection(
                 }
                 Pool::My(p) => {
                     let options = p.connect_options().as_ref().clone().database(database);
-                    sqlx::mysql::MySqlPoolOptions::new()
-                        .max_connections(2)
-                        .min_connections(0)
-                        .acquire_timeout(Duration::from_secs(10))
-                        .idle_timeout(Duration::from_secs(60))
+                    connection_options::my_pool(&conn.config)
                         .connect_with(options)
                         .await
                         .map(Pool::My)
@@ -297,8 +413,16 @@ async fn database_connection(
                 }
                 Pool::Lite(p) => Pool::Lite(p.clone()),
             };
-            pools.insert(database.into(), pool.clone());
-            pool
+            let mut pools = conn.databases.lock().await;
+            if let Some(winner) = pools.get(database) {
+                let winner = winner.clone();
+                drop(pools);
+                close(pool).await;
+                winner
+            } else {
+                pools.insert(database.into(), pool.clone());
+                pool
+            }
         }
     };
     conn.pool = pool;
@@ -309,9 +433,15 @@ async fn timed<T>(future: impl std::future::Future<Output = DbResult<T>>) -> DbR
     tokio::time::timeout(DEADLINE, future).await.map_err(|_| "Operation timed out after 30 seconds. A write may have committed; verify database state before retrying.".to_string())?
 }
 #[tauri::command]
-async fn dbde_test_connection(config: ConnectionConfig) -> DbResult<bool> {
+async fn dbde_test_connection(
+    config: ConnectionConfig,
+    state: State<'_, AppState>,
+) -> DbResult<bool> {
+    test_connection(config, &state).await
+}
+async fn test_connection(config: ConnectionConfig, state: &AppState) -> DbResult<bool> {
     timed(async {
-        let pool = make_pool(&config).await?;
+        let (pool, _tunnel) = make_pool(&config, state).await?;
         close(pool).await;
         Ok(true)
     })
@@ -319,13 +449,20 @@ async fn dbde_test_connection(config: ConnectionConfig) -> DbResult<bool> {
 }
 #[tauri::command]
 async fn dbde_connect(config: ConnectionConfig, state: State<'_, AppState>) -> DbResult<String> {
-    let pool = timed(make_pool(&config)).await?;
+    let (pool, tunnel) = timed(make_pool(&config, &state)).await?;
     let id = uuid::Uuid::new_v4().to_string();
     let mut config = config;
     config.password = None;
+    config.options.ssh.password = None;
+    if matches!(config.driver, Driver::Postgres) && config.database.is_empty() {
+        // make_pool connects to "postgres" when blank; record it so selecting that
+        // database reuses this pool instead of opening a duplicate.
+        config.database = "postgres".into();
+    }
     state.connections.lock().await.insert(
         id.clone(),
         Connection {
+            tunnel,
             pool,
             config,
             databases: Arc::new(Mutex::new(HashMap::new())),
@@ -347,10 +484,103 @@ async fn close_session(session: Session) {
 // Waits for a running query in the background; closing the socket rolls back any open transaction.
 fn close_slot(slot: SessionSlot) {
     tauri::async_runtime::spawn(async move {
-        if let Some(session) = slot.lock().await.take() {
+        if let Some(session) = slot.session.lock().await.take() {
             close_session(session).await;
         }
     });
+}
+// Cancels whatever the tab's server connection is running. Idle sessions ignore it.
+async fn cancel_server_query(conn: &Connection, server_id: u64) -> DbResult<()> {
+    match &conn.pool {
+        Pool::Pg(p) => {
+            let pid = i32::try_from(server_id).map_err(err)?;
+            sqlx::query("SELECT pg_cancel_backend($1)")
+                .bind(pid)
+                .execute(p)
+                .await
+                .map(|_| ())
+                .map_err(err)
+        }
+        Pool::My(p) => match sqlx::raw_sql(&format!("KILL QUERY {server_id}"))
+            .execute(p)
+            .await
+        {
+            // The thread may already be gone after a dropped session.
+            Ok(_) | Err(sqlx::Error::Database(_)) => Ok(()),
+            Err(e) => Err(err(e)),
+        },
+        Pool::Lite(_) => Err("SQLite queries cannot be cancelled".into()),
+    }
+}
+async fn session_slot(conn: &Connection, session_id: &str) -> Option<SessionSlot> {
+    conn.sessions.lock().await.get(session_id).cloned()
+}
+#[tauri::command]
+async fn dbde_cancel_query(
+    connection_id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> DbResult<bool> {
+    let conn = connection(&state, &connection_id).await?;
+    let Some(slot) = session_slot(&conn, &session_id).await else {
+        return Ok(false);
+    };
+    let Some(server_id) = *slot.server_id.lock().map_err(err)? else {
+        return Ok(false);
+    };
+    timed(cancel_server_query(&conn, server_id)).await?;
+    Ok(true)
+}
+async fn session_in_transaction(session: &mut Session) -> bool {
+    match &mut session.conn {
+        // Inside a transaction block the transaction started before this statement.
+        // An aborted transaction rejects the query, which also means one is open.
+        // A bare string has no arguments, so it uses the simple protocol; the extended one sends Parse and Execute
+        // separately, which moves statement_timestamp() even outside a transaction.
+        SessionConn::Pg(c) => (&mut *c)
+            .fetch_one("SELECT transaction_timestamp() <> statement_timestamp()")
+            .await
+            .and_then(|row| row.try_get::<bool, _>(0))
+            .unwrap_or(true),
+        // MariaDB exposes @@in_transaction; MySQL needs InnoDB's view, which may require
+        // the PROCESS privilege. Unknown states are reported as no open transaction.
+        SessionConn::My(c) => {
+            if let Ok(v) = sqlx::query_scalar::<_, i64>("SELECT CAST(@@in_transaction AS SIGNED)")
+                .fetch_one(&mut *c)
+                .await
+            {
+                return v != 0;
+            }
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()")
+                .fetch_one(&mut *c)
+                .await
+                .map(|n| n > 0)
+                .unwrap_or(false)
+        }
+    }
+}
+#[tauri::command]
+async fn dbde_session_in_transaction(
+    connection_id: String,
+    session_id: String,
+    state: State<'_, AppState>,
+) -> DbResult<bool> {
+    let Ok(conn) = connection(&state, &connection_id).await else {
+        return Ok(false);
+    };
+    let Some(slot) = session_slot(&conn, &session_id).await else {
+        return Ok(false);
+    };
+    let check = async {
+        match slot.session.lock().await.as_mut() {
+            Some(session) => session_in_transaction(session).await,
+            None => false,
+        }
+    };
+    // A busy session cannot be inspected quickly; assume work may be pending.
+    Ok(tokio::time::timeout(Duration::from_secs(5), check)
+        .await
+        .unwrap_or(true))
 }
 #[tauri::command]
 async fn dbde_close_session(
@@ -420,11 +650,19 @@ fn pg_cell(row: &sqlx::postgres::PgRow, i: usize) -> DbResult<Value> {
     if let Ok(v) = row.try_get::<Value, _>(i) {
         return Ok(v);
     }
-    Err(format!(
-        "Unsupported PostgreSQL type {} in column {}. Cast it to TEXT in the query.",
-        row.columns()[i].type_info().name(),
-        row.columns()[i].name()
-    ))
+    // Text-protocol values (editor and table view) are PostgreSQL's own rendering, which
+    // covers enums, arrays, intervals, network types and anything from an extension.
+    let raw = row.try_get_raw(i).map_err(err)?;
+    if raw.format() == sqlx::postgres::PgValueFormat::Text {
+        if let Ok(text) = raw.as_str() {
+            return Ok(json!(text));
+        }
+    }
+    unknown_bytes(row.try_get_unchecked::<Vec<u8>, _>(i).map_err(err)?)
+}
+// Last resort for a type DBde cannot decode: show bytes rather than failing the result.
+fn unknown_bytes(bytes: Vec<u8>) -> DbResult<Value> {
+    Ok(json!({ "hex": bytes.iter().map(|b| format!("{b:02x}")).collect::<String>() }))
 }
 fn my_cell(row: &sqlx::mysql::MySqlRow, i: usize) -> DbResult<Value> {
     common_cell!(row, i);
@@ -455,11 +693,13 @@ fn my_cell(row: &sqlx::mysql::MySqlRow, i: usize) -> DbResult<Value> {
     if let Ok(v) = row.try_get::<Value, _>(i) {
         return Ok(v);
     }
-    Err(format!(
-        "Unsupported MySQL type {} in column {}. Cast it to CHAR in the query.",
-        row.columns()[i].type_info().name(),
-        row.columns()[i].name()
-    ))
+    // BIT, GEOMETRY and similar: readable text when the bytes are text, hex otherwise.
+    let bytes = row.try_get_unchecked::<Vec<u8>, _>(i).map_err(err)?;
+    match String::from_utf8(bytes) {
+        Ok(text) if !text.chars().any(|c| c.is_control()) => Ok(json!(text)),
+        Ok(text) => unknown_bytes(text.into_bytes()),
+        Err(e) => unknown_bytes(e.into_bytes()),
+    }
 }
 fn mysql_timestamp_value(value: chrono::DateTime<chrono::Utc>) -> Value {
     json!(value.naive_utc().to_string())
@@ -544,6 +784,48 @@ async fn query_with_params(pool: &Pool, query: &str, params: &[String]) -> DbRes
 }
 // Editor text runs over the simple/text protocol: multi-statement scripts work on every
 // driver and nothing is prepared twice. The last result set wins, matching the demo.
+/// Whether `query` is one statement that returns rows, so describing it for column
+/// headers is safe and useful. Leading comments are skipped; a statement terminator
+/// anywhere but the end means a script, which is never described.
+fn describes_rows(query: &str) -> bool {
+    let mut rest = query.trim_start();
+    loop {
+        if let Some(line) = rest.strip_prefix("--") {
+            rest = line
+                .split_once('\n')
+                .map_or("", |(_, tail)| tail)
+                .trim_start();
+        } else if let Some(block) = rest.strip_prefix("/*") {
+            rest = block
+                .split_once("*/")
+                .map_or("", |(_, tail)| tail)
+                .trim_start();
+        } else {
+            break;
+        }
+    }
+    let body = rest.trim_end().trim_end_matches(';');
+    if body.contains(';') {
+        return false;
+    }
+    let keyword: String = body
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(
+        keyword.as_str(),
+        "SELECT"
+            | "WITH"
+            | "VALUES"
+            | "TABLE"
+            | "SHOW"
+            | "EXPLAIN"
+            | "PRAGMA"
+            | "DESCRIBE"
+            | "DESC"
+    )
+}
 macro_rules! raw_query {
     ($exec:expr, $query:expr, $cell:ident) => {{
         let query = $query;
@@ -586,9 +868,11 @@ macro_rules! raw_query {
                 }
             }
         }
-        if result.columns.is_empty() {
+        if result.columns.is_empty() && describes_rows(query) {
             // Rows carry column names, so an empty SELECT needs a describe to keep its headers.
-            // Scripts and statements that cannot be described simply report no columns.
+            // Only single row-returning statements are described: in PostgreSQL a failed
+            // describe (a script, or DDL whose table no longer exists) aborts an open
+            // transaction on the tab's session.
             if let Ok(description) = ($exec).describe(query).await {
                 result.columns = description
                     .columns()
@@ -608,16 +892,48 @@ async fn raw_pool_query(pool: &Pool, query: &str) -> DbResult<QueryResult> {
         Pool::Lite(p) => raw_query!(p, query, lite_cell),
     }
 }
-async fn open_session(conn: &Connection) -> DbResult<SessionConn> {
+async fn open_session(conn: &Connection) -> DbResult<(SessionConn, u64)> {
     match &conn.pool {
-        Pool::Pg(p) => sqlx::PgConnection::connect_with(p.connect_options().as_ref())
+        Pool::Pg(p) => {
+            let mut c = tokio::time::timeout(
+                conn.config.options.timeout(),
+                sqlx::PgConnection::connect_with(p.connect_options().as_ref()),
+            )
             .await
-            .map(SessionConn::Pg)
-            .map_err(err),
-        Pool::My(p) => sqlx::MySqlConnection::connect_with(p.connect_options().as_ref())
+            .map_err(|_| "Connection timeout while opening the query session.".to_string())?
+            .map_err(err)?;
+            if !conn.config.options.initial_queries.trim().is_empty() {
+                (&mut c)
+                    .execute(conn.config.options.initial_queries.as_str())
+                    .await
+                    .map_err(err)?;
+            }
+            let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                .fetch_one(&mut c)
+                .await
+                .map_err(err)?;
+            Ok((SessionConn::Pg(c), u64::try_from(pid).map_err(err)?))
+        }
+        Pool::My(p) => {
+            let mut c = tokio::time::timeout(
+                conn.config.options.timeout(),
+                sqlx::MySqlConnection::connect_with(p.connect_options().as_ref()),
+            )
             .await
-            .map(SessionConn::My)
-            .map_err(err),
+            .map_err(|_| "Connection timeout while opening the query session.".to_string())?
+            .map_err(err)?;
+            if !conn.config.options.initial_queries.trim().is_empty() {
+                (&mut c)
+                    .execute(conn.config.options.initial_queries.as_str())
+                    .await
+                    .map_err(err)?;
+            }
+            let id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+                .fetch_one(&mut c)
+                .await
+                .map_err(err)?;
+            Ok((SessionConn::My(c), id))
+        }
         Pool::Lite(_) => Err("SQLite queries share the connection pool".into()),
     }
 }
@@ -638,24 +954,35 @@ async fn session_query(conn: &Connection, session_id: &str, query: &str) -> DbRe
     }
     let slot = {
         let mut sessions = conn.sessions.lock().await;
-        if !sessions.contains_key(session_id) && sessions.len() >= MAX_SESSIONS {
+        let limit = conn.config.options.session_limit.unwrap_or(MAX_SESSIONS);
+        if !sessions.contains_key(session_id) && sessions.len() >= limit {
             return Err(format!(
-                "At most {MAX_SESSIONS} query tabs can run on one connection. Close a tab and try again."
+                "At most {limit} query tabs can run on one connection. Close a tab and try again."
             ));
         }
-        sessions.entry(session_id.into()).or_default().clone()
+        sessions
+            .entry(session_id.into())
+            .or_insert_with(|| {
+                Arc::new(SessionState {
+                    session: Mutex::new(None),
+                    server_id: std::sync::Mutex::new(None),
+                })
+            })
+            .clone()
     };
     // Holding the slot serialises a tab's queries. If the deadline drops this future,
     // the taken connection is dropped with it and the server rolls back its transaction.
-    let mut guard = slot.lock().await;
+    let mut guard = slot.session.lock().await;
     let mut session = match guard.take() {
         Some(session) if session.database == conn.config.database => session,
         previous => {
             if let Some(previous) = previous {
                 close_session(previous).await;
             }
+            let (session_conn, server_id) = open_session(conn).await?;
+            *slot.server_id.lock().map_err(err)? = Some(server_id);
             Session {
-                conn: open_session(conn).await?,
+                conn: session_conn,
                 database: conn.config.database.clone(),
             }
         }
@@ -671,6 +998,9 @@ async fn session_query(conn: &Connection, session_id: &str, query: &str) -> DbRe
     if result.is_ok() || session_alive(&mut session).await {
         *guard = Some(session);
     } else {
+        if let Ok(mut id) = slot.server_id.lock() {
+            *id = None;
+        }
         close_session(session).await;
     }
     result
@@ -681,6 +1011,7 @@ async fn dbde_execute_query(
     query: String,
     database: Option<String>,
     session_id: Option<String>,
+    timeout_secs: Option<u64>,
     state: State<'_, AppState>,
 ) -> DbResult<QueryResult> {
     if query.trim().is_empty() {
@@ -689,15 +1020,40 @@ async fn dbde_execute_query(
     if query.len() > 1_000_000 {
         return Err("Query exceeds the 1 MB limit".into());
     }
-    timed(async {
-        let conn = database_connection(&state, &connection_id, database.as_deref()).await?;
-        match (&conn.pool, session_id) {
+    let conn = timed(database_connection(
+        &state,
+        &connection_id,
+        database.as_deref(),
+    ))
+    .await?;
+    let seconds = timeout_secs
+        .or(conn.config.options.query_timeout_secs)
+        .unwrap_or(DEADLINE.as_secs())
+        .clamp(1, MAX_QUERY_TIMEOUT_SECS);
+    let session_id = session_id.filter(|_| !matches!(conn.pool, Pool::Lite(_)));
+    let run = async {
+        match &session_id {
             // SQLite pools hold one connection, so every tab already shares one session.
-            (Pool::Lite(_), _) | (_, None) => raw_pool_query(&conn.pool, &query).await,
-            (_, Some(session_id)) => session_query(&conn, &session_id, &query).await,
+            None => raw_pool_query(&conn.pool, &query).await,
+            Some(session_id) => session_query(&conn, session_id, &query).await,
         }
-    })
-    .await
+    };
+    match tokio::time::timeout(Duration::from_secs(seconds), run).await {
+        Ok(result) => result,
+        Err(_) => {
+            let Some(session_id) = session_id else {
+                return Err(format!("Query timed out after {seconds} seconds. A write may have committed; verify database state before retrying."));
+            };
+            // Dropping the client side does not stop the server, so cancel it there too.
+            if let Some(slot) = session_slot(&conn, &session_id).await {
+                let server_id = slot.server_id.lock().ok().and_then(|mut id| id.take());
+                if let Some(server_id) = server_id {
+                    let _ = timed(cancel_server_query(&conn, server_id)).await;
+                }
+            }
+            Err(format!("Query timed out after {seconds} seconds and was cancelled on the server. This tab's session was reset, so any open transaction was rolled back."))
+        }
+    }
 }
 async fn database_names(conn: &Connection) -> DbResult<Vec<String>> {
     match &conn.pool {
@@ -712,7 +1068,46 @@ async fn dbde_list_databases(
     state: State<'_, AppState>,
 ) -> DbResult<Vec<String>> {
     let conn = connection(&state, &connection_id).await?;
+    if conn.config.options.custom_database_list {
+        return Ok(conn
+            .config
+            .options
+            .database_list
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect());
+    }
+    if conn.config.database_only && !matches!(conn.config.driver, Driver::Sqlite) {
+        return Ok(vec![conn.config.database.clone()]);
+    }
     timed(database_names(&conn)).await
+}
+// Discover using the unsaved settings, without registering a workspace connection.
+// Display preferences do not restrict this temporary catalog lookup.
+#[tauri::command]
+async fn dbde_discover_databases(
+    config: ConnectionConfig,
+    state: State<'_, AppState>,
+) -> DbResult<Vec<String>> {
+    discover_databases(config, &state).await
+}
+async fn discover_databases(
+    mut config: ConnectionConfig,
+    state: &AppState,
+) -> DbResult<Vec<String>> {
+    config.database_only = false;
+    config.options.custom_database_list = false;
+    let (pool, tunnel) = timed(make_pool(&config, state)).await?;
+    let conn = Connection {
+        pool,
+        tunnel,
+        config,
+        databases: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let result = timed(database_names(&conn)).await;
+    close(conn.pool).await;
+    result
 }
 #[tauri::command]
 async fn dbde_get_schema_tree(
@@ -727,8 +1122,8 @@ async fn dbde_get_schema_tree(
     ))
     .await?;
     let sql = match conn.config.driver {
-        Driver::Postgres => "SELECT table_name, table_schema, table_type FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
-        Driver::Mysql => "SELECT table_name, table_schema, table_type FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
+        Driver::Postgres => "SELECT t.table_name, t.table_schema, t.table_type, CASE WHEN c.relkind IN ('r','p') AND c.reltuples >= 0 THEN c.reltuples::bigint END AS table_rows, CASE WHEN c.relkind IN ('r','p') THEN pg_catalog.pg_relation_size(c.oid) END AS data_length, NULL::text AS engine, NULL::text AS created_date, NULL::text AS modified_date, NULL::text AS collation, pg_catalog.obj_description(c.oid, 'pg_class') AS comment FROM information_schema.tables t JOIN pg_catalog.pg_namespace n ON n.nspname = t.table_schema JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY t.table_schema, t.table_name",
+        Driver::Mysql => "SELECT table_name, table_schema, table_type, table_rows, data_length, engine, CAST(create_time AS CHAR) AS created_date, CAST(update_time AS CHAR) AS modified_date, table_collation, table_comment FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
         Driver::Sqlite => "SELECT name, '' AS schema_name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
     };
     let result = timed(query(&conn.pool, sql)).await?;
@@ -762,6 +1157,7 @@ async fn dbde_get_schema_tree(
             conn.config.database
         },
         tables,
+        table_metadata: result.rows.iter().map(|row| table_metadata(row)).collect(),
     })
 }
 #[tauri::command]
@@ -777,13 +1173,7 @@ async fn dbde_get_columns(
         database.as_deref(),
     ))
     .await?;
-    timed(async {
-        match &conn.pool {
-            Pool::Pg(p) => { let rows = sqlx::query("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position").bind(&table.schema).bind(&table.name).fetch_all(p).await.map_err(err)?; rows.iter().map(|r| Ok(ColumnInfo { name: r.try_get(0).map_err(err)?, data_type: r.try_get(1).map_err(err)?, nullable: r.try_get::<String, _>(2).map_err(err)? == "YES" })).collect() },
-            Pool::My(p) => { let rows = sqlx::query("SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position").bind(&table.schema).bind(&table.name).fetch_all(p).await.map_err(err)?; rows.iter().map(|r| Ok(ColumnInfo { name: r.try_get(0).map_err(err)?, data_type: r.try_get(1).map_err(err)?, nullable: r.try_get::<String, _>(2).map_err(err)? == "YES" })).collect() },
-            Pool::Lite(p) => { let rows = sqlx::query("SELECT name, type, \"notnull\" FROM pragma_table_info(?)").bind(&table.name).fetch_all(p).await.map_err(err)?; rows.iter().map(|r| Ok(ColumnInfo { name: r.try_get(0).map_err(err)?, data_type: r.try_get(1).map_err(err)?, nullable: r.try_get::<i64, _>(2).map_err(err)? == 0 })).collect() },
-        }
-    }).await
+    timed(column_meta::table_columns(&conn.pool, &table)).await
 }
 async fn read_profiles(state: &AppState) -> DbResult<Vec<ConnectionConfig>> {
     match tokio::fs::read(&state.profile_path).await {
@@ -814,6 +1204,37 @@ async fn dbde_save_profile(
     validate(&config)?;
     let _guard = state.profiles.lock().await;
     let mut profiles = read_profiles(&state).await?;
+    // Keeping the stored password is only allowed while the server stays the same.
+    if config.password.is_none()
+        && !matches!(config.driver, Driver::Sqlite)
+        && profiles
+            .iter()
+            .any(|saved| saved.id == config.id && !same_server(saved, &config))
+    {
+        return Err("Enter the password again when changing the host, port or user".into());
+    }
+    if config.options.ssh.enabled
+        && config.options.ssh.password.is_none()
+        && profiles
+            .iter()
+            .any(|saved| saved.id == config.id && !same_server(saved, &config))
+    {
+        return Err(
+            "Enter the SSH password or key passphrase again when changing the server or SSH route."
+                .into(),
+        );
+    }
+    if let Some(secret) = config.options.ssh.password.take() {
+        let id = config.id.clone();
+        tokio::task::spawn_blocking(move || {
+            keyring::Entry::new("com.dbde.desktop.ssh", &id)
+                .map_err(err)?
+                .set_password(&secret)
+                .map_err(err)
+        })
+        .await
+        .map_err(err)??;
+    }
     if let Some(secret) = config.password.take() {
         if !matches!(config.driver, Driver::Sqlite) {
             let id = config.id.clone();
@@ -842,12 +1263,17 @@ async fn dbde_delete_profile(id: String, state: State<'_, AppState>) -> DbResult
     {
         tokio::task::spawn_blocking({
             let id = id.clone();
-            move || match keyring::Entry::new("com.dbde.desktop", &id)
-                .map_err(err)?
-                .delete_credential()
-            {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(err(e)),
+            move || {
+                for service in ["com.dbde.desktop", "com.dbde.desktop.ssh"] {
+                    match keyring::Entry::new(service, &id)
+                        .map_err(err)?
+                        .delete_credential()
+                    {
+                        Ok(()) | Err(keyring::Error::NoEntry) => {}
+                        Err(e) => return Err(err(e)),
+                    }
+                }
+                Ok(())
             }
         })
         .await
@@ -858,9 +1284,16 @@ async fn dbde_delete_profile(id: String, state: State<'_, AppState>) -> DbResult
 }
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            app.manage(windows::DetachedWindows::default());
+            app.manage(updates::Updates::default());
+            app.manage(export::Exports::default());
+            app.manage(import::Imports::default());
             let directory = app.path().app_data_dir()?;
             std::fs::create_dir_all(&directory)?;
+            app.manage(query_library::QueryLibrary::new(directory.clone()));
             app.manage(AppState {
                 connections: Mutex::new(HashMap::new()),
                 profiles: Mutex::new(()),
@@ -869,21 +1302,71 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updates::dbde_update_status,
+            updates::dbde_check_update,
+            updates::dbde_install_update,
+            windows::dbde_move_tab_to_window,
+            windows::dbde_get_detached_workspace,
+            windows::dbde_close_detached_window,
             dbde_test_connection,
             dbde_connect,
             dbde_disconnect,
             dbde_close_session,
+            dbde_cancel_query,
+            dbde_session_in_transaction,
             dbde_get_schema_tree,
             dbde_list_databases,
+            dbde_discover_databases,
             dbde_get_columns,
+            column_meta::dbde_get_foreign_keys,
             dbde_execute_query,
+            explain::dbde_explain_query,
+            maintain::dbde_maintain_tables,
             dbde_list_profiles,
             dbde_save_profile,
             dbde_delete_profile,
             rows::dbde_view_table,
+            rows::dbde_load_record,
             rows::dbde_delete_rows,
             rows::dbde_update_cell,
-            rows::dbde_insert_record
+            rows::dbde_raw_cell,
+            rows::dbde_insert_record,
+            rows::dbde_insert_records,
+            rows::dbde_apply_changes,
+            table_designer::dbde_create_table,
+            table_rename::dbde_rename_table_fields,
+            table_alter::dbde_alter_table_fields,
+            schema::dbde_list_indexes,
+            objects::dbde_list_objects,
+            objects::dbde_object_definition,
+            objects::dbde_object_action,
+            schema::dbde_table_ddl,
+            table_actions::dbde_copy_table,
+            table_actions::dbde_clear_table,
+            table_actions::dbde_drop_table,
+            table_actions::dbde_rename_table,
+            table_actions::dbde_export_columns,
+            database_actions::dbde_close_database,
+            database_actions::dbde_manage_database,
+            database_actions::dbde_open_sql_file,
+            schema::dbde_save_file,
+            export::dbde_export_table,
+            export::dbde_export_rows,
+            export::dbde_cancel_export,
+            import::dbde_import_open,
+            import::dbde_import_preview,
+            import::dbde_import_close,
+            import::dbde_import_target,
+            import::dbde_import_count,
+            import::dbde_import_run,
+            import::dbde_cancel_import,
+            query_library::dbde_history_list,
+            query_library::dbde_history_append,
+            query_library::dbde_history_delete,
+            query_library::dbde_history_clear,
+            query_library::dbde_library_list,
+            query_library::dbde_library_save,
+            query_library::dbde_library_delete
         ])
         .run(tauri::generate_context!())
         .expect("Failed to start DBde");
@@ -892,6 +1375,35 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn table_metadata_preserves_zero_counts_dates_and_missing_values() {
+        let row = serde_json::json!([
+            "orders",
+            "shop",
+            "BASE TABLE",
+            0,
+            16384,
+            "InnoDB",
+            "2026-10-16 10:20:30",
+            null,
+            "utf8mb4_unicode_ci",
+            "Order records"
+        ]);
+        let metadata = table_metadata(row.as_array().unwrap());
+        assert_eq!(metadata.rows, Some(0));
+        assert_eq!(metadata.data_length, Some(16384));
+        assert_eq!(
+            metadata.created_date.as_deref(),
+            Some("2026-10-16 10:20:30")
+        );
+        assert_eq!(metadata.modified_date, None);
+        assert_eq!(metadata.comment.as_deref(), Some("Order records"));
+        let sqlite =
+            table_metadata(&[Value::from("orders"), Value::from(""), Value::from("table")]);
+        assert_eq!(sqlite.rows, None);
+        assert_eq!(sqlite.data_length, None);
+        assert_eq!(sqlite.engine, None);
+    }
     #[test]
     fn mysql_empty_password_is_omitted_without_trimming_nonempty_passwords() {
         // The options Debug representation exposes the underlying Option;
@@ -905,7 +1417,7 @@ mod tests {
     async fn explicit_empty_password_does_not_read_the_credential_vault() {
         let mut config = config(Driver::Mysql);
         config.password = Some(String::new());
-        assert_eq!(password(&config).await.unwrap(), "");
+        assert_eq!(password(&config, &test_state()).await.unwrap(), "");
     }
     #[tokio::test]
     #[ignore = "Read-only integration test for local MySQL root without a password at 127.0.0.1:3306"]
@@ -916,8 +1428,9 @@ mod tests {
         config.username = "root".into();
         config.ssl_mode = "disable".into();
         config.password = Some(String::new());
-        assert!(dbde_test_connection(config.clone()).await.unwrap());
-        let pool = make_pool(&config).await.unwrap();
+        let state = test_state();
+        assert!(test_connection(config.clone(), &state).await.unwrap());
+        let (pool, _tunnel) = make_pool(&config, &state).await.unwrap();
         let result = query(&pool, "SELECT 1 AS connected").await.unwrap();
         assert_eq!(result.rows, vec![vec![json!(1)]]);
         close(pool).await;
@@ -979,7 +1492,7 @@ mod tests {
         pool.close().await;
     }
     // Uses session-local temporary tables only; nothing persists in the test database.
-    async fn server_connection(var: &str, driver: Driver) -> Connection {
+    pub(super) async fn server_connection(var: &str, driver: Driver) -> Connection {
         let url = std::env::var(var).unwrap_or_else(|_| panic!("Set {var} to a test database URL"));
         let pool = match driver {
             Driver::Postgres => Pool::Pg(
@@ -998,6 +1511,7 @@ mod tests {
             ),
         };
         Connection {
+            tunnel: None,
             pool,
             config: config(driver),
             databases: Arc::new(Mutex::new(HashMap::new())),
@@ -1040,6 +1554,42 @@ mod tests {
         assert_eq!(empty.columns, vec!["only_header"]);
         assert!(empty.rows.is_empty());
         assert_eq!(conn.sessions.lock().await.len(), 2);
+    }
+    #[tokio::test]
+    #[ignore = "Requires DBDE_TEST_PG_URL; creates only session-local temporary tables"]
+    async fn postgres_scripts_without_rows_do_not_abort_an_open_transaction() {
+        let conn = server_connection("DBDE_TEST_PG_URL", Driver::Postgres).await;
+        session_query(&conn, "tab-tx", "BEGIN").await.unwrap();
+        // A script and a statement that cannot be described after running (the table
+        // they created is gone, or there are several statements) must leave the
+        // transaction usable.
+        session_query(
+            &conn,
+            "tab-tx",
+            "CREATE TEMPORARY TABLE dbde_tx (x int); INSERT INTO dbde_tx VALUES (1)",
+        )
+        .await
+        .unwrap();
+        session_query(&conn, "tab-tx", "CREATE TEMPORARY TABLE dbde_gone (x int)")
+            .await
+            .unwrap();
+        session_query(&conn, "tab-tx", "DROP TABLE dbde_gone")
+            .await
+            .unwrap();
+        let count = session_query(&conn, "tab-tx", "SELECT COUNT(*) AS n FROM dbde_tx")
+            .await
+            .unwrap();
+        assert_eq!(count.rows, vec![vec![json!(1)]]);
+        // An empty SELECT still reports its column headers.
+        let empty = session_query(
+            &conn,
+            "tab-tx",
+            "SELECT x AS header FROM dbde_tx WHERE false",
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty.columns, vec!["header"]);
+        session_query(&conn, "tab-tx", "ROLLBACK").await.unwrap();
     }
     #[tokio::test]
     #[ignore = "Requires DBDE_TEST_PG_URL; creates only session-local temporary tables"]
@@ -1096,8 +1646,219 @@ mod tests {
             .unwrap();
         assert_eq!(left.rows, vec![vec![json!(1), json!("seen")]]);
     }
+    async fn cancel_stops_the_running_statement(conn: Connection, sleep: &str) {
+        session_query(&conn, "tab-c", "SELECT 1").await.unwrap();
+        let slot = session_slot(&conn, "tab-c").await.unwrap();
+        let server_id = slot.server_id.lock().unwrap().unwrap();
+        let started = Instant::now();
+        let (result, _) = tokio::join!(session_query(&conn, "tab-c", sleep), async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel_server_query(&conn, server_id).await.unwrap();
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "query was not cancelled"
+        );
+        // PostgreSQL reports an error; MySQL may return the interrupted SLEEP's value.
+        let _ = result;
+        // The session survives a cancel and keeps working.
+        let after = session_query(&conn, "tab-c", "SELECT 2 AS two")
+            .await
+            .unwrap();
+        assert_eq!(after.rows, vec![vec![json!(2)]]);
+        let mut guard = slot.session.lock().await;
+        let session = guard.as_mut().unwrap();
+        assert!(!session_in_transaction(session).await);
+        drop(guard);
+        session_query(&conn, "tab-c", "BEGIN").await.unwrap();
+        let mut guard = slot.session.lock().await;
+        assert!(session_in_transaction(guard.as_mut().unwrap()).await);
+        drop(guard);
+        session_query(&conn, "tab-c", "ROLLBACK").await.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "Requires DBDE_TEST_PG_URL"]
+    async fn postgres_cancel_and_transaction_state() {
+        let conn = server_connection("DBDE_TEST_PG_URL", Driver::Postgres).await;
+        cancel_stops_the_running_statement(conn, "SELECT pg_sleep(20)").await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires DBDE_TEST_MYSQL_URL"]
+    async fn mysql_cancel_and_transaction_state() {
+        let conn = server_connection("DBDE_TEST_MYSQL_URL", Driver::Mysql).await;
+        cancel_stops_the_running_statement(conn, "SELECT SLEEP(20)").await;
+    }
+    #[tokio::test]
+    #[ignore = "Requires DBDE_TEST_PG_URL; creates only session-local temporary objects"]
+    async fn postgres_uncommon_types_render_instead_of_failing() {
+        let conn = server_connection("DBDE_TEST_PG_URL", Driver::Postgres).await;
+        let sql = "SELECT ARRAY['a','b']::text[] AS tags, interval '1 day 2 hours' AS span, inet '10.0.0.1' AS ip, 12.50::numeric AS price, '2026-10-13 15:42:11+00'::timestamptz AS at, '\\x0aff'::bytea AS raw, '{\"k\": 1}'::jsonb AS doc, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid AS id, true AS ok";
+        let r = session_query(&conn, "tab-t", sql).await.unwrap();
+        assert_eq!(r.rows[0][0], json!("{a,b}"));
+        assert_eq!(r.rows[0][1], json!("1 day 02:00:00"));
+        assert_eq!(r.rows[0][2], json!("10.0.0.1"));
+        assert_eq!(r.rows[0][3], json!("12.50"));
+        assert_eq!(r.rows[0][4], json!("2026-10-13T15:42:11+00:00"));
+        assert_eq!(r.rows[0][5], json!({"hex": "0aff"}));
+        assert_eq!(r.rows[0][6], json!({"k": 1}));
+        assert_eq!(r.rows[0][7], json!("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"));
+        assert_eq!(r.rows[0][8], json!(true));
+        // Table view goes through the pool; its single connection sees the temp objects.
+        raw_pool_query(&conn.pool, "CREATE TYPE pg_temp.dbde_mood AS ENUM ('calm', 'busy'); CREATE TEMPORARY TABLE dbde_types (id int PRIMARY KEY, mood pg_temp.dbde_mood, tags text[], span interval); INSERT INTO dbde_types VALUES (1, 'busy', '{x,y}', '3 hours')").await.unwrap();
+        let schema = query(
+            &conn.pool,
+            "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()",
+        )
+        .await
+        .unwrap()
+        .rows[0][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let table = TableInfo {
+            name: "dbde_types".into(),
+            schema,
+            kind: "table".into(),
+        };
+        let view = rows::tests_support::view(&conn, table.clone()).await;
+        assert_eq!(
+            view,
+            vec![vec![
+                json!(1),
+                json!("busy"),
+                json!("{x,y}"),
+                json!("03:00:00")
+            ]]
+        );
+        let filtered =
+            rows::tests_support::filtered(&conn, table, "mood", "us'; DROP TABLE x; --").await;
+        assert!(filtered.is_empty());
+    }
+    #[tokio::test]
+    #[ignore = "Requires DBDE_TEST_PG_URL as a superuser; changes only a temporary table's statistics"]
+    async fn postgres_large_tables_use_the_planner_estimate() {
+        let conn = server_connection("DBDE_TEST_PG_URL", Driver::Postgres).await;
+        raw_pool_query(&conn.pool, "CREATE TEMPORARY TABLE dbde_big (id int PRIMARY KEY); INSERT INTO dbde_big SELECT generate_series(1, 30); UPDATE pg_class SET reltuples = 2500000 WHERE oid = 'dbde_big'::regclass").await.unwrap();
+        let schema = query(
+            &conn.pool,
+            "SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()",
+        )
+        .await
+        .unwrap()
+        .rows[0][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let table = TableInfo {
+            name: "dbde_big".into(),
+            schema,
+            kind: "table".into(),
+        };
+        let page = rows::tests_support::page_json(&conn, table.clone(), &[]).await;
+        assert_eq!(page["total_rows"], json!(2_500_000));
+        assert_eq!(page["estimated"], json!(true));
+        // Filters always count exactly.
+        let filtered = rows::tests_support::page_json(&conn, table, &["id", "1"]).await;
+        assert_eq!(filtered["total_rows"], json!(12));
+        assert!(filtered.get("estimated").is_none());
+    }
+    #[tokio::test]
+    async fn sqlite_untyped_numeric_keys_still_match() {
+        let pool = Pool::Lite(
+            sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        query(&pool, "CREATE TABLE loose (id PRIMARY KEY, note)")
+            .await
+            .unwrap();
+        query(
+            &pool,
+            "INSERT INTO loose VALUES (7, 'seven'), ('7', 'text seven')",
+        )
+        .await
+        .unwrap();
+        let conn = Connection {
+            tunnel: None,
+            pool,
+            config: config(Driver::Sqlite),
+            databases: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let table = TableInfo {
+            name: "loose".into(),
+            schema: "".into(),
+            kind: "table".into(),
+        };
+        let key = HashMap::from([("id".to_string(), json!(7))]);
+        rows::tests_support::update(&conn, &table, &key, "note", Some("number".into()))
+            .await
+            .unwrap();
+        let text_key = HashMap::from([("id".to_string(), json!("7"))]);
+        assert_eq!(
+            rows::tests_support::delete(&conn, &table, &[text_key])
+                .await
+                .unwrap(),
+            1
+        );
+        let left = query(&conn.pool, "SELECT id, note FROM loose")
+            .await
+            .unwrap();
+        assert_eq!(left.rows, vec![vec![json!(7), json!("number")]]);
+    }
+    fn test_state() -> AppState {
+        AppState {
+            connections: Mutex::new(HashMap::new()),
+            profiles: Mutex::new(()),
+            profile_path: std::env::temp_dir()
+                .join(format!("dbde-test-{}.json", uuid::Uuid::new_v4())),
+        }
+    }
+    #[tokio::test]
+    async fn stored_passwords_only_reach_the_saved_server() {
+        let state = test_state();
+        let mut saved = config(Driver::Postgres);
+        saved.password = None;
+        write_profiles(&state, std::slice::from_ref(&saved))
+            .await
+            .unwrap();
+        assert!(saved_profile_matches(&state, &saved).await.unwrap());
+        let mut redirected = saved.clone();
+        redirected.host = "attacker.example".into();
+        assert!(password(&redirected, &state).await.is_err());
+        let mut unknown = saved.clone();
+        unknown.id = uuid::Uuid::new_v4().to_string();
+        assert!(password(&unknown, &state).await.is_err());
+        let _ = std::fs::remove_file(&state.profile_path);
+    }
+    #[test]
+    fn only_single_row_returning_statements_are_described() {
+        for yes in [
+            "SELECT 1",
+            "  -- note\n select * from t;",
+            "/* c */ WITH x AS (SELECT 1) SELECT * FROM x",
+            "values (1)",
+            "SHOW TABLES",
+            "PRAGMA table_info(t)",
+        ] {
+            assert!(describes_rows(yes), "{yes}");
+        }
+        for no in [
+            "BEGIN",
+            "DROP TABLE t",
+            "INSERT INTO t VALUES (1)",
+            "CREATE TABLE t (x int); INSERT INTO t VALUES (1)",
+            "SELECT 1; SELECT 2",
+            "",
+        ] {
+            assert!(!describes_rows(no), "{no}");
+        }
+    }
     pub(super) fn config(driver: Driver) -> ConnectionConfig {
         ConnectionConfig {
+            options: Default::default(),
             id: uuid::Uuid::new_v4().to_string(),
             name: "Server".into(),
             driver,
@@ -1106,6 +1867,7 @@ mod tests {
             username: "user".into(),
             password: Some("".into()),
             database: "".into(),
+            database_only: false,
             ssl_mode: "require".into(),
             file_path: ":memory:".into(),
         }
@@ -1121,11 +1883,40 @@ mod tests {
         invalid.file_path.clear();
         assert!(validate(&invalid).is_err());
     }
+    #[test]
+    fn focused_profiles_require_a_database_and_round_trip() {
+        let mut c = config(Driver::Mysql);
+        c.database_only = true;
+        assert!(validate(&c).is_err());
+        c.database = "app_db".into();
+        assert!(validate(&c).is_ok());
+        let saved = serde_json::to_value(&c).unwrap();
+        assert_eq!(saved["database_only"], true);
+        let loaded: ConnectionConfig = serde_json::from_value(saved.clone()).unwrap();
+        assert!(loaded.database_only);
+        let mut legacy = saved;
+        legacy.as_object_mut().unwrap().remove("database_only");
+        let loaded: ConnectionConfig = serde_json::from_value(legacy).unwrap();
+        assert!(!loaded.database_only);
+    }
+    #[tokio::test]
+    async fn catalog_preview_ignores_display_filters_and_does_not_register_connections() {
+        let mut config = config(Driver::Sqlite);
+        config.options.custom_database_list = true;
+        config.database_only = true;
+        let state = test_state();
+        assert_eq!(
+            discover_databases(config, &state).await.unwrap(),
+            vec![":memory:"]
+        );
+        assert!(state.connections.lock().await.is_empty());
+    }
     #[tokio::test]
     async fn sqlite_database_discovery_keeps_the_same_file_pool() {
         let config = config(Driver::Sqlite);
-        let pool = make_pool(&config).await.unwrap();
+        let (pool, _tunnel) = make_pool(&config, &test_state()).await.unwrap();
         let conn = Connection {
+            tunnel: None,
             pool,
             config,
             databases: Arc::new(Mutex::new(HashMap::new())),
@@ -1199,6 +1990,7 @@ mod tests {
     #[test]
     fn credentials_never_serialize() {
         let config = ConnectionConfig {
+            options: Default::default(),
             id: uuid::Uuid::new_v4().to_string(),
             name: "test".into(),
             driver: Driver::Postgres,
@@ -1207,6 +1999,7 @@ mod tests {
             username: "user".into(),
             password: Some("top-secret".into()),
             database: "test".into(),
+            database_only: false,
             ssl_mode: "require".into(),
             file_path: "".into(),
         };

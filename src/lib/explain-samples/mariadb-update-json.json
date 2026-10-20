@@ -1,0 +1,15 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "table": {
+      "update": 1,
+      "table_name": "o",
+      "access_type": "index",
+      "key": "PRIMARY",
+      "key_length": "",
+      "used_key_parts": ["id"],
+      "rows": 5266,
+      "attached_condition": "o.total > 4990"
+    }
+  }
+}

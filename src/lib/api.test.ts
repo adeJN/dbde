@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { loadTableDetails } from "./table-structure";
 vi.mock("sql.js/dist/sql-wasm.wasm?url", () => ({
   default: "node_modules/sql.js/dist/sql-wasm.wasm",
 }));
@@ -10,8 +11,74 @@ import {
   deleteRows,
   insertRecord,
   updateCell,
+  listIndexes,
+  tableDdl,
+  insertRecords,
+  renameTableFields,
 } from "./api";
 describe("real SQLite browser sandbox", () => {
+  it("renames a field without losing its records or default and rejects conflicting names", async () => {
+    await execute(
+      "demo",
+      "CREATE TABLE rename_test (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'Guest'); CREATE INDEX rename_name ON rename_test(name); INSERT INTO rename_test VALUES (1,'Ada');",
+    );
+    const table = { name: "rename_test", schema: "", kind: "table" };
+    try {
+      await renameTableFields("demo", "workspace", table, [
+        { from: "name", to: "full name" },
+      ]);
+      expect(
+        (await execute("demo", 'SELECT "full name" FROM rename_test')).rows,
+      ).toEqual([["Ada"]]);
+      expect(await tableDdl("demo", table)).toContain(
+        '"full name" TEXT NOT NULL DEFAULT',
+      );
+      await expect(
+        renameTableFields("demo", "workspace", table, [
+          { from: "full name", to: "ID" },
+        ]),
+      ).rejects.toThrow("already exists");
+      expect((await columns("demo", table)).map((field) => field.name)).toEqual(
+        ["id", "full name"],
+      );
+    } finally {
+      await execute("demo", "DROP TABLE rename_test;");
+    }
+  });
+  it("loads designer metadata for generated fields, defaults, composite relationships and triggers", async () => {
+    await execute(
+      "demo",
+      "CREATE TABLE structure_parent (a INTEGER, b INTEGER, PRIMARY KEY (a,b)); CREATE TABLE structure_child (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, name TEXT DEFAULT 'Guest', label TEXT GENERATED ALWAYS AS (upper(name)) VIRTUAL, FOREIGN KEY(a,b) REFERENCES structure_parent(a,b), CHECK(length(name)>0)); CREATE TRIGGER structure_changed AFTER UPDATE ON structure_child BEGIN SELECT 1; END;",
+    );
+    try {
+      const details = await loadTableDetails(
+        "demo",
+        "workspace",
+        { name: "structure_child", schema: "", kind: "table" },
+        "sqlite",
+      );
+      expect(details.fields.find((field) => field.name === "id")?.primary).toBe(
+        true,
+      );
+      expect(
+        details.fields.find((field) => field.name === "label")?.generated,
+      ).toBe(true);
+      expect(
+        details.fields.find((field) => field.name === "name")?.default_value,
+      ).toBe("'Guest'");
+      expect(details.foreignKeys).toHaveLength(1);
+      expect(details.foreignKeys[0].definition).toContain(
+        "(a, b) → structure_parent (a, b)",
+      );
+      expect(details.triggers[0].name).toBe("structure_changed");
+      expect(details.unavailable).toContain("Checks");
+    } finally {
+      await execute(
+        "demo",
+        "DROP TABLE structure_child; DROP TABLE structure_parent;",
+      );
+    }
+  });
   it("sorts all pages and writes only validated record columns", async () => {
     await execute(
       "demo",
@@ -43,13 +110,13 @@ describe("real SQLite browser sandbox", () => {
     ).toBe(1);
     await expect(
       updateCell("demo", page.source!, { id: page.rows[0][0] }, "id", "99"),
-    ).rejects.toThrow("cannot be edited");
+    ).resolves.toBe(1);
     expect(
       await insertRecord("demo", page.source!, { name: "New", note: null }),
     ).toBe(1);
     await expect(
       insertRecord("demo", page.source!, { bad: "x" }),
-    ).rejects.toThrow("Unknown insert column");
+    ).rejects.toThrow(/unknown column/i);
     const refreshed = await viewTable("demo", "workspace", table);
     expect(refreshed.pagination?.total_rows).toBe(4);
     expect(refreshed.rows.find((row) => row[1] === "Bob")?.[2]).toBe(
@@ -228,4 +295,165 @@ describe("real SQLite browser sandbox", () => {
     expect(large.rows).toHaveLength(50000);
     expect(large.truncated).toBe(true);
   });
+});
+describe("sandbox schema metadata", () => {
+  it("lists indexes and exports CREATE statements", async () => {
+    await execute(
+      "demo",
+      "CREATE TABLE idx_test (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT); CREATE INDEX idx_test_name ON idx_test (name, email)",
+    );
+    const table = { name: "idx_test", schema: "", kind: "table" };
+    const indexes = await listIndexes("demo", table);
+    expect(indexes.find((i) => i.name === "idx_test_name")).toEqual({
+      name: "idx_test_name",
+      columns: ["name", "email"],
+      unique: false,
+      primary: false,
+    });
+    expect(indexes.some((i) => i.unique && i.columns[0] === "email")).toBe(
+      true,
+    );
+    const ddl = await tableDdl("demo", table);
+    expect(ddl).toMatch(/^CREATE TABLE idx_test/);
+    expect(ddl).toContain(
+      "CREATE INDEX idx_test_name ON idx_test (name, email);",
+    );
+    await execute("demo", "DROP TABLE idx_test");
+  });
+});
+describe("sandbox batch inserts", () => {
+  it("saves every record or none", async () => {
+    await execute(
+      "demo",
+      "CREATE TABLE batch_test (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, note TEXT DEFAULT 'none')",
+    );
+    const source = {
+      database: "workspace",
+      table: { name: "batch_test", schema: "", kind: "table" },
+      primary_keys: ["id"],
+    };
+    expect(
+      await insertRecords("demo", source, [
+        { email: "a@x" },
+        { email: "b@x", note: null },
+      ]),
+    ).toBe(2);
+    await expect(
+      insertRecords("demo", source, [{ email: "c@x" }, { email: "a@x" }]),
+    ).rejects.toThrow(/Record 2 of 2.*No records were saved/);
+    expect(
+      (await execute("demo", "SELECT email, note FROM batch_test ORDER BY id"))
+        .rows,
+    ).toEqual([
+      ["a@x", "none"],
+      ["b@x", null],
+    ]);
+    await execute("demo", "DROP TABLE batch_test");
+  });
+});
+
+it("blocks invalid typed values before any sandbox batch writes", async () => {
+  const { applyChanges } = await import("./api");
+  await execute(
+    "demo",
+    "CREATE TABLE typed_values (id INTEGER PRIMARY KEY, qty INTEGER NOT NULL, code VARCHAR(3), payload JSON)",
+  );
+  const source = {
+    database: "workspace",
+    table: { name: "typed_values", schema: "", kind: "table" },
+    primary_keys: ["id"],
+  };
+  await expect(
+    applyChanges("demo", source, [
+      { kind: "insert", values: { qty: "2" } },
+      { kind: "insert", values: { qty: "no" } },
+    ]),
+  ).rejects.toThrow("Record 2: qty");
+  expect(
+    (await execute("demo", "SELECT * FROM typed_values")).rows,
+  ).toHaveLength(0);
+  await expect(
+    insertRecords("demo", source, [{ qty: "1", code: "long" }]),
+  ).rejects.toThrow("Maximum 3");
+  await insertRecord("demo", source, {
+    qty: "3",
+    code: "abc",
+    payload: '{"ok":true}',
+  });
+  await expect(
+    updateCell("demo", source, { id: 1 }, "qty", null),
+  ).rejects.toThrow("NULL is not allowed");
+  expect((await execute("demo", "SELECT qty FROM typed_values")).rows).toEqual([
+    [3],
+  ]);
+});
+
+it("updates composite keys atomically and preserves data on uniqueness or FK conflicts", async () => {
+  const { applyChanges } = await import("./api");
+  await execute(
+    "demo",
+    "PRAGMA foreign_keys=ON; CREATE TABLE pk_parent (tenant TEXT NOT NULL, id INTEGER NOT NULL, name TEXT, PRIMARY KEY(tenant,id)); INSERT INTO pk_parent VALUES('a',1,'first'),('b',2,'second'); CREATE TABLE pk_child (tenant TEXT, parent_id INTEGER, FOREIGN KEY(tenant,parent_id) REFERENCES pk_parent(tenant,id) ON UPDATE CASCADE); INSERT INTO pk_child VALUES('a',1);",
+  );
+  const source = (
+    await viewTable("demo", "workspace", {
+      name: "pk_parent",
+      schema: "",
+      kind: "table",
+    })
+  ).source!;
+  await applyChanges("demo", source, [
+    {
+      kind: "update",
+      key: { tenant: "a", id: 1 },
+      values: { tenant: "new", id: "7", name: "edited" },
+    },
+  ]);
+  expect(
+    (await execute("demo", "SELECT tenant,parent_id FROM pk_child")).rows,
+  ).toEqual([["new", 7]]);
+  await expect(
+    applyChanges("demo", source, [
+      {
+        kind: "update",
+        key: { tenant: "new", id: 7 },
+        values: { name: "rollback" },
+      },
+      {
+        kind: "update",
+        key: { tenant: "b", id: 2 },
+        values: { tenant: "new", id: "7" },
+      },
+    ]),
+  ).rejects.toThrow();
+  expect(
+    (await execute("demo", "SELECT name FROM pk_parent WHERE tenant='new'"))
+      .rows,
+  ).toEqual([["edited"]]);
+  await expect(
+    applyChanges("demo", source, [
+      { kind: "update", key: { tenant: "new", id: 7 }, values: { id: null } },
+    ]),
+  ).rejects.toThrow(/cannot be NULL/);
+  await expect(
+    applyChanges("demo", source, [
+      { kind: "update", key: { tenant: "new", id: 7 }, values: { id: "8" } },
+      { kind: "delete", key: { tenant: "new", id: 7 } },
+    ]),
+  ).rejects.toThrow(/same record/);
+  await execute(
+    "demo",
+    "CREATE TABLE pk_restrict (tenant TEXT,parent_id INTEGER,FOREIGN KEY(tenant,parent_id) REFERENCES pk_parent(tenant,id) ON UPDATE RESTRICT); INSERT INTO pk_restrict VALUES('new',7);",
+  );
+  await expect(
+    updateCell("demo", source, { tenant: "new", id: 7 }, "id", "8"),
+  ).rejects.toThrow();
+  expect(
+    (await execute("demo", "SELECT tenant,parent_id FROM pk_child")).rows,
+  ).toEqual([["new", 7]]);
+  await execute("demo", "DELETE FROM pk_restrict; DELETE FROM pk_child;");
+  await updateCell("demo", source, { tenant: "new", id: 7 }, "id", "9");
+  await deleteRows("demo", source, [{ tenant: "new", id: 9 }]);
+  expect(
+    (await execute("demo", "SELECT tenant,id FROM pk_parent")).rows,
+  ).toEqual([["b", 2]]);
 });

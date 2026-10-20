@@ -12,10 +12,15 @@ export default function Pagination({
   rowCount,
   busy,
   onChange,
+  estimated = false,
+  hasNext,
 }: {
   page: number;
   pageSize: number;
   totalRows: number;
+  /** totalRows is the planner's estimate, so the last page is approximate. */
+  estimated?: boolean;
+  hasNext?: boolean;
   rowCount: number;
   busy: boolean;
   onChange: (page: number, pageSize: number) => void;
@@ -52,11 +57,17 @@ export default function Pagination({
   const pages = Math.max(1, Math.ceil(totalRows / pageSize));
   const start = rowCount ? (page - 1) * pageSize + 1 : 0;
   const end = rowCount ? start + rowCount - 1 : 0;
+  const nextAvailable = estimated
+    ? (hasNext ?? rowCount >= pageSize)
+    : page < pages;
   return (
     <nav className="pagination" aria-label="Table pagination">
       <span className="page-range" aria-live="polite">
         {start.toLocaleString()}–{end.toLocaleString()}{" "}
-        <span>of {totalRows.toLocaleString()} rows</span>
+        <span title={estimated ? "Estimated from table statistics" : undefined}>
+          of {estimated ? "≈ " : ""}
+          {totalRows.toLocaleString()} rows
+        </span>
       </span>
       <div className="pagination-controls">
         <label>
@@ -94,7 +105,8 @@ export default function Pagination({
           />
         </label>
         <span className="page-position">
-          Page {page.toLocaleString()} of {pages.toLocaleString()}
+          Page {page.toLocaleString()} of {estimated ? "≈ " : ""}
+          {Math.max(page, pages).toLocaleString()}
         </span>
         <div className="page-buttons">
           <button
@@ -119,7 +131,7 @@ export default function Pagination({
             className="icon-button"
             aria-label="Next page"
             title="Next page"
-            disabled={busy || page >= pages}
+            disabled={busy || !nextAvailable}
             onClick={() => onChange(page + 1, pageSize)}
           >
             <ChevronRight size={15} />
@@ -127,8 +139,12 @@ export default function Pagination({
           <button
             className="icon-button"
             aria-label="Last page"
-            title="Last page"
-            disabled={busy || page >= pages}
+            title={
+              estimated
+                ? "The last page is unknown while row counts are estimated"
+                : "Last page"
+            }
+            disabled={busy || estimated || page >= pages}
             onClick={() => onChange(pages, pageSize)}
           >
             <ChevronsRight size={15} />

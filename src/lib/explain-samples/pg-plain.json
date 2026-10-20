@@ -1,0 +1,76 @@
+[
+  {
+    "Plan": {
+      "Node Type": "Sort",
+      "Parallel Aware": false,
+      "Async Capable": false,
+      "Startup Cost": 184.77,
+      "Total Cost": 184.89,
+      "Plan Rows": 49,
+      "Plan Width": 36,
+      "Sort Key": ["(sum(o.total)) DESC"],
+      "Plans": [
+        {
+          "Node Type": "Aggregate",
+          "Strategy": "Hashed",
+          "Partial Mode": "Simple",
+          "Parent Relationship": "Outer",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 182.78,
+          "Total Cost": 183.39,
+          "Plan Rows": 49,
+          "Plan Width": 36,
+          "Group Key": ["c.name"],
+          "Planned Partitions": 0,
+          "Plans": [
+            {
+              "Node Type": "Nested Loop",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Join Type": "Inner",
+              "Startup Cost": 0.56,
+              "Total Cost": 181.55,
+              "Plan Rows": 245,
+              "Plan Width": 9,
+              "Inner Unique": false,
+              "Plans": [
+                {
+                  "Node Type": "Index Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "c_pkey",
+                  "Relation Name": "c",
+                  "Alias": "c",
+                  "Startup Cost": 0.28,
+                  "Total Cost": 9.13,
+                  "Plan Rows": 49,
+                  "Plan Width": 8,
+                  "Index Cond": "(id < 50)"
+                },
+                {
+                  "Node Type": "Index Scan",
+                  "Parent Relationship": "Inner",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Scan Direction": "Forward",
+                  "Index Name": "o_c",
+                  "Relation Name": "o",
+                  "Alias": "o",
+                  "Startup Cost": 0.28,
+                  "Total Cost": 3.47,
+                  "Plan Rows": 5,
+                  "Plan Width": 9,
+                  "Index Cond": "(c_id = c.id)"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

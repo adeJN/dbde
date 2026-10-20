@@ -1,0 +1,15 @@
+{
+  "sqlite_version": "3.51.0",
+  "sql": "EXPLAIN QUERY PLAN SELECT customer_id, count(*) FROM orders GROUP BY customer_id UNION ALL SELECT id, 1 FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE total > 5)",
+  "columns": ["id", "parent", "notused", "detail"],
+  "rows": [
+    [1, 0, 0, "COMPOUND QUERY"],
+    [2, 1, 0, "LEFT-MOST SUBQUERY"],
+    [8, 2, 213, "SCAN orders USING COVERING INDEX orders_customer"],
+    [35, 1, 0, "UNION ALL"],
+    [37, 35, 91, "SEARCH customers USING INTEGER PRIMARY KEY (rowid=?)"],
+    [41, 35, 0, "LIST SUBQUERY 2"],
+    [44, 41, 216, "SCAN orders"],
+    [53, 41, 0, "CREATE BLOOM FILTER"]
+  ]
+}

@@ -11,12 +11,14 @@ import {
 import App from "./App";
 import { useWorkspace } from "./store";
 import type { ConnectionConfig, QueryResult } from "./types";
-const { viewTable, deleteRows, insertRecord, updateCell } = vi.hoisted(() => ({
-  viewTable: vi.fn(),
-  deleteRows: vi.fn(),
-  insertRecord: vi.fn(),
-  updateCell: vi.fn(),
-}));
+const { viewTable, deleteRows, applyChanges, connect, listProfiles } =
+  vi.hoisted(() => ({
+    connect: vi.fn(),
+    listProfiles: vi.fn().mockResolvedValue([]),
+    viewTable: vi.fn(),
+    deleteRows: vi.fn(),
+    applyChanges: vi.fn(),
+  }));
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
     getTotalSize: () => count * 37,
@@ -36,12 +38,22 @@ vi.mock("./components/QueryEditor", () => ({
 }));
 vi.mock("./lib/api", () => ({
   desktop: true,
-  listProfiles: async () => [],
+  columns: async () => [
+    { name: "id", data_type: "INTEGER", nullable: false },
+    { name: "name", data_type: "TEXT", nullable: true },
+  ],
+  listProfiles,
+  connect,
   viewTable,
   deleteRows,
-  insertRecord,
-  updateCell,
+  applyChanges,
   schema: async () => ({ database: "workspace", tables: [] }),
+  listHistory: async () => [],
+  appendHistory: async () => undefined,
+  listLibrary: async () => [],
+  saveLibraryItems: async () => undefined,
+  deleteLibraryItems: async () => undefined,
+  onLibraryChange: async () => () => undefined,
 }));
 const config: ConnectionConfig = {
   id: "server",
@@ -64,12 +76,12 @@ const result: QueryResult = {
   source: { database: "workspace", table, primary_keys: ["id"] },
 };
 beforeEach(() => {
+  connect.mockReset();
+  listProfiles.mockResolvedValue([]);
   deleteRows.mockReset();
   deleteRows.mockResolvedValue(1);
-  insertRecord.mockReset();
-  insertRecord.mockResolvedValue(1);
-  updateCell.mockReset();
-  updateCell.mockResolvedValue(1);
+  applyChanges.mockReset();
+  applyChanges.mockResolvedValue(1);
   viewTable.mockReset();
   viewTable.mockResolvedValue(result);
   useWorkspace.setState({
@@ -97,6 +109,39 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 describe("table-first workspace", () => {
+  it("keeps unsaved cell edits on the tab and asks before closing it", async () => {
+    render(<App />);
+    const ada = screen.getByRole("cell", { name: "Ada" });
+    ada.focus();
+    fireEvent.keyDown(ada, { key: "B" });
+    fireEvent.keyDown(
+      screen.getByRole("textbox", { name: "Edit name in cell" }),
+      {
+        key: "Tab",
+        shiftKey: true,
+      },
+    );
+    expect(
+      useWorkspace.getState().tabs.find((t) => t.id === "table-tab")?.staged
+        ?.edits,
+    ).toEqual({ "[1]": { key: { id: 1 }, values: { name: "B" } } });
+    expect(applyChanges).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close customers" }));
+    const prompt = await screen.findByRole("alertdialog");
+    expect(within(prompt).getByText("customers: 1 change(s)")).toBeTruthy();
+    fireEvent.click(within(prompt).getByRole("button", { name: "Cancel" }));
+    expect(useWorkspace.getState().tabs).toHaveLength(1);
+    // Saving clears the prompt: Ctrl/⌘+S writes through applyChanges.
+    fireEvent.keyDown(screen.getByRole("cell", { name: "B" }), {
+      key: "s",
+      ctrlKey: true,
+    });
+    await waitFor(() =>
+      expect(applyChanges).toHaveBeenCalledWith("server", result.source, [
+        { kind: "update", key: { id: 1 }, values: { name: "B" } },
+      ]),
+    );
+  });
   it("reloads the page where a newly inserted record can appear", async () => {
     useWorkspace.getState().updateTab("table-tab", {
       result: {
@@ -118,9 +163,9 @@ describe("table-first workspace", () => {
       }),
     );
     await waitFor(() =>
-      expect(insertRecord).toHaveBeenCalledWith("server", result.source, {
-        name: "New",
-      }),
+      expect(applyChanges).toHaveBeenCalledWith("server", result.source, [
+        { kind: "insert", values: { name: "New" } },
+      ]),
     );
     await waitFor(() =>
       expect(viewTable).toHaveBeenCalledWith(
@@ -194,6 +239,7 @@ describe("table-first workspace", () => {
         250,
         [],
         undefined,
+        false,
       ),
     );
   });
@@ -248,6 +294,7 @@ describe("table-first workspace", () => {
         1000,
         [],
         undefined,
+        false,
       ),
     );
     expect(
@@ -282,4 +329,55 @@ describe("table-first workspace", () => {
     expect(useWorkspace.getState().tabs).toHaveLength(2);
     expect(viewTable).toHaveBeenCalledTimes(1);
   });
+});
+
+it("focuses an already active saved connection without adding a second sidebar entry or query tab", async () => {
+  listProfiles.mockResolvedValue([config]);
+  connect.mockResolvedValue("server");
+  useWorkspace.setState({
+    activeTab: "",
+    tabs: [
+      ...useWorkspace.getState().tabs,
+      {
+        id: "other",
+        name: "Other",
+        connectionId: "other-server",
+        query: "SELECT 1",
+        running: false,
+      },
+    ],
+  });
+  render(<App />);
+  await waitFor(() =>
+    expect(screen.getAllByRole("button", { name: "Local SQLite" }).length).toBe(
+      2,
+    ),
+  );
+  const saved = screen
+    .getAllByRole("button", { name: "Local SQLite" })
+    .find((button) => button.closest(".saved-row"))!;
+  fireEvent.click(saved);
+  await waitFor(() =>
+    expect(useWorkspace.getState().activeTab).toBe("table-tab"),
+  );
+  expect(useWorkspace.getState().sessions).toHaveLength(1);
+  expect(useWorkspace.getState().tabs).toHaveLength(2);
+});
+it("replaces browser context menus with workspace and text actions", async () => {
+  const { container } = render(<App />);
+  const app = container.querySelector<HTMLElement>(".app")!;
+  expect(fireEvent.contextMenu(app, { clientX: 12, clientY: 12 })).toBe(false);
+  const menu = screen.getByRole("menu", { name: "Workspace actions" });
+  expect(
+    within(menu).getByRole("menuitem", { name: "New Connection…" }),
+  ).toBeTruthy();
+  expect(within(menu).queryByText(/Inspect|Reload/)).toBeNull();
+  fireEvent.keyDown(menu, { key: "Escape" });
+  const search = screen.getByPlaceholderText("Find database or table…");
+  expect(search).toBeTruthy();
+  fireEvent.contextMenu(search);
+  expect(
+    screen.getByRole("menu", { name: "Text editing actions" }),
+  ).toBeTruthy();
+  expect(screen.queryByRole("menu", { name: "Workspace actions" })).toBeNull();
 });

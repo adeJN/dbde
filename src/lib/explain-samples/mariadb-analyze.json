@@ -1,0 +1,44 @@
+{
+  "query_block": {
+    "select_id": 1,
+    "r_loops": 1,
+    "r_total_time_ms": 5.1434,
+    "filesort": {
+      "sort_key": "sum(o.total) desc",
+      "r_loops": 1,
+      "r_total_time_ms": 0.3492,
+      "r_used_priority_queue": false,
+      "r_output_rows": 159,
+      "r_buffer_size": "5Kb",
+      "temporary_table": {
+        "table": {
+          "table_name": "c",
+          "access_type": "ALL",
+          "possible_keys": ["PRIMARY"],
+          "r_loops": 1,
+          "rows": 1205,
+          "r_rows": 1000,
+          "r_total_time_ms": 0.9189,
+          "filtered": 100,
+          "r_filtered": 15.9,
+          "attached_condition": "c.`id` < 50 or c.`name` like 'n9%'"
+        },
+        "table": {
+          "table_name": "o",
+          "access_type": "ref",
+          "possible_keys": ["o_c"],
+          "key": "o_c",
+          "key_length": "5",
+          "used_key_parts": ["c_id"],
+          "ref": ["test.c.id"],
+          "r_loops": 159,
+          "rows": 2,
+          "r_rows": 5,
+          "r_total_time_ms": 1.5548,
+          "filtered": 100,
+          "r_filtered": 100
+        }
+      }
+    }
+  }
+}
