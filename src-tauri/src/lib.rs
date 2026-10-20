@@ -429,6 +429,24 @@ async fn database_connection(
     conn.config.database = database.into();
     Ok(conn)
 }
+// MySQL-compatible servers expose every accessible database in information_schema.
+// Listing another database must not open a new pool or change the shared session's
+// default database; PostgreSQL catalogs still require a database-specific pool.
+async fn schema_connection(
+    state: &AppState,
+    id: &str,
+    database: Option<&str>,
+) -> DbResult<Connection> {
+    let mut conn = connection(state, id).await?;
+    if matches!(conn.pool, Pool::My(_)) {
+        if let Some(database) = database.filter(|name| !name.is_empty()) {
+            conn.config.database = database.into();
+        }
+        Ok(conn)
+    } else {
+        database_connection(state, id, database).await
+    }
+}
 async fn timed<T>(future: impl std::future::Future<Output = DbResult<T>>) -> DbResult<T> {
     tokio::time::timeout(DEADLINE, future).await.map_err(|_| "Operation timed out after 30 seconds. A write may have committed; verify database state before retrying.".to_string())?
 }
@@ -1115,18 +1133,25 @@ async fn dbde_get_schema_tree(
     database: Option<String>,
     state: State<'_, AppState>,
 ) -> DbResult<SchemaTree> {
-    let conn = timed(database_connection(
-        &state,
-        &connection_id,
-        database.as_deref(),
-    ))
-    .await?;
+    load_schema_tree(&state, &connection_id, database.as_deref()).await
+}
+async fn load_schema_tree(
+    state: &AppState,
+    connection_id: &str,
+    database: Option<&str>,
+) -> DbResult<SchemaTree> {
+    let conn = timed(schema_connection(state, connection_id, database)).await?;
     let sql = match conn.config.driver {
         Driver::Postgres => "SELECT t.table_name, t.table_schema, t.table_type, CASE WHEN c.relkind IN ('r','p') AND c.reltuples >= 0 THEN c.reltuples::bigint END AS table_rows, CASE WHEN c.relkind IN ('r','p') THEN pg_catalog.pg_relation_size(c.oid) END AS data_length, NULL::text AS engine, NULL::text AS created_date, NULL::text AS modified_date, NULL::text AS collation, pg_catalog.obj_description(c.oid, 'pg_class') AS comment FROM information_schema.tables t JOIN pg_catalog.pg_namespace n ON n.nspname = t.table_schema JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = t.table_name WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY t.table_schema, t.table_name",
-        Driver::Mysql => "SELECT table_name, table_schema, table_type, table_rows, data_length, engine, CAST(create_time AS CHAR) AS created_date, CAST(update_time AS CHAR) AS modified_date, table_collation, table_comment FROM information_schema.tables WHERE table_schema = DATABASE() ORDER BY table_name",
+        Driver::Mysql => "SELECT table_name, table_schema, table_type, table_rows, data_length, engine, CAST(create_time AS CHAR) AS created_date, CAST(update_time AS CHAR) AS modified_date, table_collation, table_comment FROM information_schema.tables WHERE table_schema = ? ORDER BY table_name",
         Driver::Sqlite => "SELECT name, '' AS schema_name, type FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY name",
     };
-    let result = timed(query(&conn.pool, sql)).await?;
+    let params = if matches!(conn.pool, Pool::My(_)) {
+        vec![conn.config.database.clone()]
+    } else {
+        Vec::new()
+    };
+    let result = timed(query_with_params(&conn.pool, sql, &params)).await?;
     let tables = result
         .rows
         .iter()
@@ -1910,6 +1935,104 @@ mod tests {
             vec![":memory:"]
         );
         assert!(state.connections.lock().await.is_empty());
+    }
+    #[tokio::test]
+    async fn mysql_schema_navigation_reuses_the_server_pool_without_connecting() {
+        // A lazy pool cannot reach a database. Metadata routing must still work
+        // without opening additional pools or altering connection options.
+        let mut config = config(Driver::Mysql);
+        config.database = "original".into();
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .connect_lazy_with(sqlx::mysql::MySqlConnectOptions::new().database("original"));
+        let conn = Connection {
+            tunnel: None,
+            pool: Pool::My(pool.clone()),
+            config,
+            databases: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let state = AppState {
+            connections: Mutex::new(HashMap::from([("server".into(), conn)])),
+            profiles: Mutex::new(()),
+            profile_path: PathBuf::new(),
+        };
+        let (a, b) = tokio::join!(
+            schema_connection(&state, "server", Some("other database")),
+            schema_connection(&state, "server", Some("third_database")),
+        );
+        assert_eq!(a.unwrap().config.database, "other database");
+        assert_eq!(b.unwrap().config.database, "third_database");
+        assert_eq!(pool.size(), 0);
+        assert_eq!(pool.connect_options().get_database(), Some("original"));
+        let original = connection(&state, "server").await.unwrap();
+        assert_eq!(original.config.database, "original");
+        assert!(original.databases.lock().await.is_empty());
+        assert!(schema_connection(&state, "missing", Some("other"))
+            .await
+            .is_err());
+        pool.close().await;
+    }
+    #[tokio::test]
+    #[ignore = "requires DBDE_TEST_MYSQL_URL; read-only MySQL/MariaDB/TiDB integration"]
+    async fn mysql_schema_navigation_reads_other_databases_without_new_pools() {
+        let url = std::env::var("DBDE_TEST_MYSQL_URL").expect("Set DBDE_TEST_MYSQL_URL");
+        let options = sqlx::mysql::MySqlConnectOptions::from_str(&url).unwrap();
+        let mut config = config(Driver::Mysql);
+        config.database = options.get_database().unwrap_or_default().into();
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let before: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let databases: Vec<String> = sqlx::query_scalar("SHOW DATABASES")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(!databases.is_empty());
+        let conn = Connection {
+            tunnel: None,
+            pool: Pool::My(pool.clone()),
+            config,
+            databases: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let state = AppState {
+            connections: Mutex::new(HashMap::from([("server".into(), conn)])),
+            profiles: Mutex::new(()),
+            profile_path: PathBuf::new(),
+        };
+        for database in databases.iter().take(3) {
+            let tree = load_schema_tree(&state, "server", Some(database))
+                .await
+                .unwrap();
+            assert_eq!(&tree.database, database);
+            assert!(tree.tables.iter().all(|table| &table.schema == database));
+            let expected: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = ?",
+            )
+            .bind(database)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(tree.tables.len() as i64, expected);
+        }
+        let after: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        assert!(connection(&state, "server")
+            .await
+            .unwrap()
+            .databases
+            .lock()
+            .await
+            .is_empty());
+        pool.close().await;
     }
     #[tokio::test]
     async fn sqlite_database_discovery_keeps_the_same_file_pool() {

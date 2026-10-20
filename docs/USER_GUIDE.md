@@ -24,6 +24,14 @@ Host umumnya `127.0.0.1`, port umumnya `3306`. Gunakan username yang memang terd
 
 Pesan `Access denied` berarti server menolak login. Periksa akun, password, host asal yang diizinkan, serta apakah port menunjuk ke instance MySQL yang benar.
 
+### TiDB Cloud
+
+Gunakan tipe koneksi **MySQL**, host/port/username dari panel **Connect** TiDB, dan TLS sesuai petunjuk endpoint. Jangan menonaktifkan SSL untuk endpoint cloud yang mewajibkan TLS.
+
+Daftar tabel MySQL/TiDB dibaca melalui pool koneksi server yang sudah ada, dengan nama database sebagai bind parameter. Membuka daftar database lain tidak membuat pool baru atau menjalankan `USE` pada sesi bersama. Membuka data tabel atau query pada database lain tetap dapat memerlukan koneksi khusus.
+
+`Connection reset by peer` berarti server atau jalur jaringan memutus koneksi; pesan itu saja belum menentukan penyebabnya. Jika muncul langsung, bandingkan endpoint/akun yang sama di client lain dan periksa status cluster, IP access list, serta quota di TiDB Cloud. Jika muncul setelah idle, periksa batas idle/lifetime. Pada Starter, quota yang habis dapat menolak koneksi baru meski koneksi lama masih ada. Lihat [batas koneksi dan quota resmi TiDB Cloud](https://docs.pingcap.com/tidbcloud/serverless-limitations/).
+
 ### Database yang ditampilkan
 
 Tanpa daftar khusus, Explorer menampilkan database yang dapat diakses oleh akun. Buka tab **Databases** pada pengaturan koneksi untuk memilih database yang ingin ditampilkan dan menentukan **Auto Open**. Pilihan ini hanya mengatur tampilan; tidak membuat atau menghapus database di server.
