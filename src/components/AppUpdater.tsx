@@ -25,6 +25,7 @@ export default function AppUpdater() {
   const [status, setStatus] = useState<UpdateStatus>();
   const [available, setAvailable] = useState<AvailableUpdate | null>(null);
   const [checked, setChecked] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [progress, setProgress] = useState<UpdateProgress>();
@@ -41,12 +42,20 @@ export default function AppUpdater() {
     busy.current = true;
     setChecking(true);
     setError("");
+    setUnavailable(false);
     try {
       const configuration = await updateStatus();
       setStatus(configuration);
       if (configuration.configured) {
-        setAvailable(await checkUpdate());
-        setChecked(true);
+        const result = await checkUpdate();
+        if (result && "unavailable" in result) {
+          setUnavailable(true);
+          setAvailable(null);
+          setChecked(false);
+        } else {
+          setAvailable(result);
+          setChecked(true);
+        }
       }
     } catch (cause) {
       setError(String(cause));
@@ -214,6 +223,14 @@ export default function AppUpdater() {
                   </p>
                 ) : available ? (
                   <h3>DBde {available.version} is available</h3>
+                ) : unavailable ? (
+                  <div className="app-update-empty" role="status">
+                    <h3>Update information is not available yet</h3>
+                    <p>
+                      Updates appear here after a release is published. You can
+                      continue using DBde and check again later.
+                    </p>
+                  </div>
                 ) : checked ? (
                   <p className="app-update-state app-update-success">
                     <CheckCircle2 size={18} />

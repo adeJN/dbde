@@ -107,6 +107,9 @@
 .app-update-success {
   color: var(--theme-success-text);
 }
+.app-update-empty p {
+  color: var(--theme-text-muted);
+}
 .app-update-notes {
   padding: 12px;
   border: 1px solid var(--theme-border);

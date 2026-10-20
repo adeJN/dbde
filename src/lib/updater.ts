@@ -21,8 +21,12 @@ export const updateStatus = (): Promise<UpdateStatus> =>
   isTauri()
     ? invoke("dbde_update_status")
     : Promise.resolve({ currentVersion: version, configured: false });
-export const checkUpdate = (): Promise<AvailableUpdate | null> =>
-  invoke("dbde_check_update");
+export interface UpdateUnavailable {
+  unavailable: true;
+}
+export const checkUpdate = (): Promise<
+  AvailableUpdate | UpdateUnavailable | null
+> => invoke("dbde_check_update");
 export const installUpdate = (onProgress: (event: UpdateProgress) => void) => {
   const onEvent = new Channel<UpdateProgress>();
   onEvent.onmessage = onProgress;

@@ -23,6 +23,13 @@ pub(crate) struct AvailableUpdate {
     notes: String,
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+pub(crate) enum CheckResult {
+    Available(AvailableUpdate),
+    Unavailable { unavailable: bool },
+}
+
 #[derive(Clone, Serialize)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub(crate) enum Progress {
@@ -80,7 +87,7 @@ pub(crate) async fn dbde_check_update(
     app: AppHandle,
     window: WebviewWindow,
     updates: State<'_, Updates>,
-) -> DbResult<Option<AvailableUpdate>> {
+) -> DbResult<Option<CheckResult>> {
     main_only(&window)?;
     configured(&app)?;
     let _operation = updates
@@ -93,13 +100,28 @@ pub(crate) async fn dbde_check_update(
         .timeout(Duration::from_secs(300))
         .build()
         .map_err(err)?;
-    let found = tokio::time::timeout(Duration::from_secs(20), updater.check())
-        .await.map_err(|_| "Update check timed out. Check your internet connection and retry.")?
-        .map_err(|e| format!("Unable to check GitHub Releases. If this is the first release, publish latest.json first. {e}"))?;
-    let info = found.as_ref().map(|update| AvailableUpdate {
-        version: update.version.clone(),
-        current_version: update.current_version.clone(),
-        notes: update.body.clone().unwrap_or_default(),
+    let result = tokio::time::timeout(Duration::from_secs(20), updater.check())
+        .await
+        .map_err(|_| "Update check timed out. Check your internet connection and retry.")?;
+    let found = match result {
+        Ok(found) => found,
+        // The static endpoint has no usable release yet. Keep this distinct from
+        // a valid manifest with no newer version, and from connection failures.
+        Err(tauri_plugin_updater::Error::ReleaseNotFound) => {
+            return Ok(Some(CheckResult::Unavailable { unavailable: true }));
+        }
+        Err(error) => {
+            return Err(format!(
+                "Unable to check for updates. Please try again. {error}"
+            ))
+        }
+    };
+    let info = found.as_ref().map(|update| {
+        CheckResult::Available(AvailableUpdate {
+            version: update.version.clone(),
+            current_version: update.current_version.clone(),
+            notes: update.body.clone().unwrap_or_default(),
+        })
     });
     *updates.pending.lock().await = found;
     Ok(info)

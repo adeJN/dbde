@@ -161,7 +161,7 @@ Direct cross-database copy supports MySQL/MariaDB databases on the same server a
 
 DBde 0.2.0 introduces signed in-app updates. The download icon in the title bar opens **App updates**. DBde checks once shortly after launch and every six hours; checks only show an availability badge and never install automatically. **Download & install** verifies the artifact signature, installs, and restarts DBde. Save SQL and table changes, finish transactions, close all connections and detached table windows, and wait for imports/exports before installing. Failed checks or downloads remain retryable. The browser sandbox cannot install desktop updates.
 
-The public endpoint is `https://github.com/adeJN/dbde/releases/latest/download/latest.json`. The repository and release assets must be publicly downloadable. Do not embed a GitHub access token in the app. This endpoint returns an error until the first release with `latest.json` is published.
+The public endpoint is `https://github.com/adeJN/dbde/releases/latest/download/latest.json`. The repository and release assets must be publicly downloadable. Do not embed a GitHub access token in the app. Until a release with `latest.json` is published, the app shows “Update information is not available yet”. This is distinct from a valid check reporting that the installed version is up to date. Network failures remain retryable errors.
 
 ### First installation and signing key
 

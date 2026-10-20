@@ -86,6 +86,18 @@ it("shows retry after a failed check", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Retry" }));
   await screen.findByText("DBde 0.3.0 is available");
 });
+it("explains missing release information without an error or an up-to-date claim", async () => {
+  vi.mocked(checkUpdate).mockResolvedValueOnce({ unavailable: true });
+  open();
+  await screen.findByText("Update information is not available yet");
+  expect(screen.queryByRole("alert")).toBeNull();
+  expect(screen.queryByText("You’re up to date.")).toBeNull();
+  expect(
+    screen.queryByRole("button", { name: /Download & install/ }),
+  ).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "Check for updates" }));
+  await screen.findByText("DBde 0.3.0 is available");
+});
 it("shows download progress and keeps the dialog open during installation", async () => {
   let reject!: (error: Error) => void;
   vi.mocked(installUpdate).mockImplementation((progress) => {
