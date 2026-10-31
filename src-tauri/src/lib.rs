@@ -1073,10 +1073,23 @@ async fn dbde_execute_query(
         }
     }
 }
+// SHOW DATABASES can report names as VARBINARY on some MySQL-compatible
+// servers/session collations. These values are metadata text, not record BLOBs.
+// Skip only the SQL type compatibility check; String decoding still validates UTF-8.
+fn mysql_metadata_text(row: &sqlx::mysql::MySqlRow, index: usize) -> DbResult<String> {
+    row.try_get_unchecked::<String, _>(index).map_err(err)
+}
+async fn mysql_database_names(pool: &sqlx::MySqlPool) -> DbResult<Vec<String>> {
+    let rows = sqlx::query("SHOW DATABASES")
+        .fetch_all(pool)
+        .await
+        .map_err(err)?;
+    rows.iter().map(|row| mysql_metadata_text(row, 0)).collect()
+}
 async fn database_names(conn: &Connection) -> DbResult<Vec<String>> {
     match &conn.pool {
         Pool::Pg(p) => sqlx::query_scalar::<_, String>("SELECT datname FROM pg_database WHERE datallowconn AND NOT datistemplate AND has_database_privilege(current_user, oid, 'CONNECT') ORDER BY datname").fetch_all(p).await.map_err(err),
-        Pool::My(p) => sqlx::query_scalar::<_, String>("SHOW DATABASES").fetch_all(p).await.map_err(err),
+        Pool::My(p) => mysql_database_names(p).await,
         Pool::Lite(_) => Ok(vec![PathBuf::from(&conn.config.file_path).file_name().unwrap_or_default().to_string_lossy().into()]),
     }
 }
@@ -1937,6 +1950,35 @@ mod tests {
         assert!(state.connections.lock().await.is_empty());
     }
     #[tokio::test]
+    #[ignore = "requires DBDE_TEST_MYSQL_URL; read-only metadata/session-only MySQL test"]
+    async fn mysql_database_names_accept_binary_metadata_without_changing_record_blobs() {
+        let url = std::env::var("DBDE_TEST_MYSQL_URL").expect("Set DBDE_TEST_MYSQL_URL");
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT CAST('database café' AS BINARY) AS binary_name, CAST('plain_name' AS CHAR) AS text_name, CAST(NULL AS BINARY) AS null_name, X'FFFE' AS invalid_name")
+            .fetch_one(&pool).await.unwrap();
+        // Reproduce the reported mismatch, then verify the metadata-only decoder.
+        assert!(row.try_get::<String, _>(0).is_err());
+        assert_eq!(mysql_metadata_text(&row, 0).unwrap(), "database café");
+        assert_eq!(mysql_metadata_text(&row, 1).unwrap(), "plain_name");
+        assert!(mysql_metadata_text(&row, 2).is_err());
+        assert!(mysql_metadata_text(&row, 3).is_err());
+        assert_eq!(
+            my_cell(&row, 0).unwrap(),
+            json!({"hex": "646174616261736520636166c3a9"})
+        );
+        let expected = mysql_database_names(&pool).await.unwrap();
+        sqlx::query("SET SESSION character_set_results = binary")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(mysql_database_names(&pool).await.unwrap(), expected);
+        pool.close().await;
+    }
+    #[tokio::test]
     async fn mysql_schema_navigation_reuses_the_server_pool_without_connecting() {
         // A lazy pool cannot reach a database. Metadata routing must still work
         // without opening additional pools or altering connection options.
@@ -1988,10 +2030,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let databases: Vec<String> = sqlx::query_scalar("SHOW DATABASES")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let databases = mysql_database_names(&pool).await.unwrap();
         assert!(!databases.is_empty());
         let conn = Connection {
             tunnel: None,
