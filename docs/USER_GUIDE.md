@@ -45,6 +45,10 @@ Tanpa daftar khusus, Explorer menampilkan database yang dapat diakses oleh akun.
 
 Password SSH dan database bisa berbeda. Jangan memasukkan password ke nama koneksi atau catatan. HTTP tunnel belum tersedia.
 
+Jika server bisa diakses lewat Navicat tetapi DBde menampilkan **SSH host key is not trusted yet**, Navicat dan DBde memakai sumber kepercayaan host yang berbeda. DBde tidak mengambil trust dari Navicat secara otomatis. Isi **Host key fingerprint (optional)** dengan fingerprint SHA256 yang diverifikasi bersama administrator, atau hubungkan host SSH yang sama melalui OpenSSH di Mac ini dan verifikasi fingerprint sebelum menyimpannya di `~/.ssh/known_hosts`.
+
+Host dan port yang harus cocok adalah tujuan pada tab **SSH**, bukan alamat database `127.0.0.1` di General. Jika kunci yang sudah dipercaya berubah atau fingerprint tidak cocok, verifikasi perubahan dengan administrator sebelum mengubah entri tepercaya. DBde tetap menolak host yang belum dipercaya dan tidak mengganti kunci host otomatis.
+
 ## Menjelajahi tabel
 
 Klik nama database untuk membuka daftar tabel dalam tab. Panah di Explorer mengatur expand/collapse secara terpisah. Klik dua kali tabel untuk membuka datanya. Tabel yang sudah dibuka akan mengaktifkan tab yang sama pada konteks koneksi/database tersebut.

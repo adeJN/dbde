@@ -82,18 +82,52 @@ impl SshOptions {
     }
 }
 
+#[derive(Debug)]
+enum SshConnectError {
+    UnknownHost,
+    ChangedHost,
+    FingerprintMismatch,
+    KnownHosts(keys::Error),
+    Protocol(russh::Error),
+}
+impl From<russh::Error> for SshConnectError {
+    fn from(error: russh::Error) -> Self {
+        Self::Protocol(error)
+    }
+}
+impl SshConnectError {
+    fn message(self, secret: &str) -> String {
+        match self {
+            Self::UnknownHost => "SSH host key is not trusted yet. DBde uses ~/.ssh/known_hosts, which is separate from Navicat. In the SSH tab, enter a SHA256 host key fingerprint verified with your server administrator, or verify this host with OpenSSH on this Mac and retry.".into(),
+            Self::ChangedHost => "SSH host key has changed from the entry in ~/.ssh/known_hosts. Verify the new key with your server administrator before updating the trusted entry.".into(),
+            Self::FingerprintMismatch => "SSH host key does not match the fingerprint entered in the SSH tab. Verify the server and its SHA256 fingerprint before retrying.".into(),
+            Self::KnownHosts(error) => format!("Cannot read or verify SSH known_hosts: {}", safe_error(error, secret)),
+            Self::Protocol(error) => format!("SSH connection failed: {}", safe_error(error, secret)),
+        }
+    }
+}
+
 struct HostVerifier {
     host: String,
     port: u16,
     fingerprint: String,
 }
 impl client::Handler for HostVerifier {
-    type Error = russh::Error;
+    type Error = SshConnectError;
     async fn check_server_key(&mut self, key: &PublicKey) -> Result<bool, Self::Error> {
         if !self.fingerprint.is_empty() {
-            return Ok(key.fingerprint(HashAlg::Sha256).to_string() == self.fingerprint);
+            return if key.fingerprint(HashAlg::Sha256).to_string() == self.fingerprint {
+                Ok(true)
+            } else {
+                Err(SshConnectError::FingerprintMismatch)
+            };
         }
-        Ok(keys::check_known_hosts(&self.host, self.port, key).unwrap_or(false))
+        match keys::check_known_hosts(&self.host, self.port, key) {
+            Ok(true) => Ok(true),
+            Ok(false) => Err(SshConnectError::UnknownHost),
+            Err(keys::Error::KeyChanged { .. }) => Err(SshConnectError::ChangedHost),
+            Err(error) => Err(SshConnectError::KnownHosts(error)),
+        }
     }
 }
 
@@ -186,8 +220,13 @@ pub(crate) async fn open(
             keepalive_interval: Some(Duration::from_secs(30)),
             ..Default::default()
         };
-        let mut session = client::connect(Arc::new(settings), (ssh.host.trim(), ssh.port.unwrap_or(22)), handler).await
-            .map_err(|e| format!("SSH connection failed: {e}. Verify the server key in ~/.ssh/known_hosts or supply its trusted SHA256 fingerprint."))?;
+        let mut session = client::connect(
+            Arc::new(settings),
+            (ssh.host.trim(), ssh.port.unwrap_or(22)),
+            handler,
+        )
+        .await
+        .map_err(|error| error.message(&secret))?;
         let result = if ssh.auth == "private_key" {
             let path = ssh.private_key.clone();
             let passphrase = secret.clone();
@@ -202,12 +241,12 @@ pub(crate) async fn open(
                 )
             })
             .await
-            .map_err(err)?
-            .map_err(|e| format!("Cannot load SSH private key: {e}"))?;
+            .map_err(|e| safe_error(e, &secret))?
+            .map_err(|e| format!("Cannot load SSH private key: {}", safe_error(e, &secret)))?;
             let hash = session
                 .best_supported_rsa_hash()
                 .await
-                .map_err(err)?
+                .map_err(|e| safe_error(e, &secret))?
                 .flatten();
             session
                 .authenticate_publickey(
@@ -215,12 +254,12 @@ pub(crate) async fn open(
                     PrivateKeyWithHashAlg::new(Arc::new(key), hash),
                 )
                 .await
-                .map_err(err)?
+                .map_err(|e| safe_error(e, &secret))?
         } else {
             session
                 .authenticate_password(&ssh.username, &secret)
                 .await
-                .map_err(err)?
+                .map_err(|e| safe_error(e, &secret))?
         };
         if !result.success() {
             return Err(
@@ -233,9 +272,12 @@ pub(crate) async fn open(
             .channel_open_direct_tcpip(&config.host, u32::from(config.port), "127.0.0.1", 0)
             .await
             .map_err(|e| {
-                format!("SSH cannot reach the database destination or forwarding is disabled: {e}")
+                format!(
+                    "SSH cannot reach the database destination or forwarding is disabled: {}",
+                    safe_error(e, &secret)
+                )
             })?;
-        probe.close().await.map_err(err)?;
+        probe.close().await.map_err(|e| safe_error(e, &secret))?;
         #[cfg(unix)]
         let (listener, directory, socket) = {
             use std::os::unix::fs::DirBuilderExt;
@@ -244,7 +286,7 @@ pub(crate) async fn open(
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&directory)
-                .map_err(err)?;
+                .map_err(|e| safe_error(e, &secret))?;
             let socket = directory.join(if matches!(config.driver, Driver::Postgres) {
                 format!(".s.PGSQL.{}", config.port)
             } else {
@@ -254,16 +296,19 @@ pub(crate) async fn open(
                 Ok(listener) => (listener, directory, socket),
                 Err(e) => {
                     let _ = std::fs::remove_dir(&directory);
-                    return Err(err(e));
+                    return Err(safe_error(e, &secret));
                 }
             }
         };
         #[cfg(not(unix))]
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
-            .map_err(err)?;
+            .map_err(|e| safe_error(e, &secret))?;
         #[cfg(not(unix))]
-        let port = listener.local_addr().map_err(err)?.port();
+        let port = listener
+            .local_addr()
+            .map_err(|e| safe_error(e, &secret))?
+            .port();
         let host = config.host.clone();
         let port_target = config.port;
         let task = tokio::spawn(async move {
@@ -300,12 +345,34 @@ pub(crate) async fn open(
     tokio::time::timeout(config.options.timeout(), operation)
         .await
         .map_err(|_| "SSH connection timed out.".to_string())?
-        .map_err(|e: String| safe_error(e, &secret))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn host_key_guidance_is_readable_even_when_secret_matches_normal_prose() {
+        for secret in ["", " ", "e", "SSH"] {
+            let message = SshConnectError::UnknownHost.message(secret);
+            assert!(message.contains("SSH host key is not trusted yet"));
+            assert!(message.contains("separate from Navicat"));
+            assert!(!message.contains("[redacted]"));
+        }
+        assert!(SshConnectError::ChangedHost
+            .message(" ")
+            .contains("has changed"));
+        assert!(SshConnectError::FingerprintMismatch
+            .message(" ")
+            .contains("does not match"));
+    }
+    #[test]
+    fn untrusted_error_details_still_redact_secrets() {
+        let error = keys::Error::IO(std::io::Error::other("failed to read test-secret"));
+        let message = SshConnectError::KnownHosts(error).message("test-secret");
+        assert!(message.starts_with("Cannot read or verify SSH known_hosts:"));
+        assert!(!message.contains("test-secret"));
+        assert!(message.contains("[redacted]"));
+    }
     #[test]
     fn validates_route_and_never_serializes_secrets() {
         let mut config = crate::tests::config(Driver::Mysql);
@@ -348,7 +415,10 @@ mod tests {
         use russh::client::Handler;
         assert!(handler.check_server_key(public).await.unwrap());
         handler.fingerprint = format!("SHA256:{}", "A".repeat(43));
-        assert!(!handler.check_server_key(public).await.unwrap());
+        assert!(matches!(
+            handler.check_server_key(public).await,
+            Err(SshConnectError::FingerprintMismatch)
+        ));
     }
     #[cfg(unix)]
     #[derive(Clone)]
@@ -461,6 +531,14 @@ mod tests {
             password: Some("test-secret".into()),
             ..Default::default()
         };
+        let verified_fingerprint = config.options.ssh.fingerprint.clone();
+        config.options.ssh.fingerprint.clear();
+        config.options.ssh.password = Some(" ".into());
+        let untrusted = open(&config, &state).await.err().unwrap();
+        assert!(untrusted.contains("host key is not trusted yet"));
+        assert!(!untrusted.contains("[redacted]"));
+        config.options.ssh.fingerprint = verified_fingerprint;
+        config.options.ssh.password = Some("test-secret".into());
         let tunnel = open(&config, &state).await.unwrap().unwrap();
         let directory = tunnel.directory.clone();
         let shared = tunnel.clone();

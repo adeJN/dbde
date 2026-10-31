@@ -470,7 +470,8 @@ export default function ConnectionSettings({
                 <small>
                   Leave blank to verify against ~/.ssh/known_hosts. For a new
                   host, enter a SHA256 fingerprint obtained from your server
-                  administrator.
+                  administrator. Hosts trusted only in Navicat are not
+                  automatically trusted here.
                 </small>
               </label>
             </fieldset>
