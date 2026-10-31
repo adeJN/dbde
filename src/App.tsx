@@ -1,3 +1,4 @@
+import { version as appVersion } from "../package.json";
 import type { DatabaseToolPane } from "./components/databaseToolItems";
 import DatabaseTools from "./components/DatabaseTools";
 import AreaContextMenu, { type AreaMenu } from "./components/AreaContextMenu";
@@ -4168,7 +4169,7 @@ export default function App() {
                       : session.config.driver === "mysql"
                         ? "MySQL"
                         : "SQLite"
-                    : "v0.1.0"}
+                    : `v${appVersion}`}
                 </span>
               </h1>
             </div>
