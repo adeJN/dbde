@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -331,7 +332,7 @@ describe("table-first workspace", () => {
   });
 });
 
-it("focuses an already active saved connection without adding a second sidebar entry or query tab", async () => {
+it("hides active saved connections and shows them again after disconnecting", async () => {
   listProfiles.mockResolvedValue([config]);
   connect.mockResolvedValue("server");
   useWorkspace.setState({
@@ -348,20 +349,20 @@ it("focuses an already active saved connection without adding a second sidebar e
     ],
   });
   render(<App />);
-  await waitFor(() =>
-    expect(screen.getAllByRole("button", { name: "Local SQLite" }).length).toBe(
-      2,
-    ),
+  await waitFor(() => expect(listProfiles).toHaveBeenCalled());
+  expect(screen.getAllByRole("button", { name: "Local SQLite" })).toHaveLength(
+    1,
   );
-  const saved = screen
-    .getAllByRole("button", { name: "Local SQLite" })
-    .find((button) => button.closest(".saved-row"))!;
-  fireEvent.click(saved);
-  await waitFor(() =>
-    expect(useWorkspace.getState().activeTab).toBe("table-tab"),
-  );
+  expect(
+    screen.getByRole("button", { name: "Local SQLite" }).closest(".saved-row"),
+  ).toBeNull();
+  expect(screen.queryByText("SAVED CONNECTIONS")).toBeNull();
   expect(useWorkspace.getState().sessions).toHaveLength(1);
   expect(useWorkspace.getState().tabs).toHaveLength(2);
+  act(() => useWorkspace.getState().removeSession("server"));
+  const saved = await screen.findByRole("button", { name: "Local SQLite" });
+  expect(saved.closest(".saved-row")).not.toBeNull();
+  expect(screen.getByText("SAVED CONNECTIONS")).toBeTruthy();
 });
 it("replaces browser context menus with workspace and text actions", async () => {
   const { container } = render(<App />);

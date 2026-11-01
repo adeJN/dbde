@@ -115,9 +115,9 @@ pub(crate) async fn table_columns(pool: &Pool, table: &TableInfo) -> DbResult<Ve
             rows.iter()
                 .map(|r| {
                     Ok(mysql_column(
-                        r.try_get(0).map_err(err)?,
-                        r.try_get(1).map_err(err)?,
-                        r.try_get::<String, _>(2).map_err(err)? == "YES",
+                        mysql_metadata_text(r, 0)?,
+                        mysql_metadata_text(r, 1)?,
+                        mysql_metadata_text(r, 2)? == "YES",
                     ))
                 })
                 .collect()

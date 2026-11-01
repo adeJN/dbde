@@ -30,8 +30,8 @@ async fn list_indexes(conn: &Connection, table: &TableInfo) -> DbResult<Vec<Inde
                 .bind(&table.name).fetch_all(p).await.map_err(err)?;
             let mut indexes: Vec<IndexInfo> = Vec::new();
             for r in &rows {
-                let name: String = r.try_get(0).map_err(err)?;
-                let column: String = r.try_get(1).map_err(err)?;
+                let name = mysql_metadata_text(r, 0)?;
+                let column = mysql_metadata_text(r, 1)?;
                 let non_unique: i64 = r.try_get(2).map_err(err)?;
                 match indexes.last_mut() {
                     Some(last) if last.name == name => last.columns.push(column),

@@ -999,7 +999,9 @@ it("keeps the database edit form available when cancelling its unsaved-changes c
     within(form).getByRole("textbox", { name: "Database name" }),
     { target: { value: "renamed" } },
   );
-  fireEvent.click(within(form).getByRole("button", { name: "Save Changes" }));
+  fireEvent.click(
+    within(form).getByRole("button", { name: "Rename Database…" }),
+  );
   const prompt = await screen.findByRole("alertdialog");
   fireEvent.click(within(prompt).getByRole("button", { name: "Cancel" }));
   await waitFor(() =>
@@ -1276,11 +1278,8 @@ it("asks before deleting a connection profile and never runs DROP DATABASE", asy
   workspace("SELECT 1");
   api.listProfiles.mockResolvedValue([config]);
   render(<App />);
-  await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Remove Postgres" }),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(api.listProfiles).toHaveBeenCalled());
+  expect(screen.queryByRole("button", { name: "Remove Postgres" })).toBeNull();
   await connectionMenu();
   fireEvent.click(screen.getByRole("menuitem", { name: "Delete Connection" }));
   fireEvent.click(
@@ -1907,11 +1906,10 @@ it("switches to an already open profile without discarding that profile's tabs",
   api.listProfiles.mockResolvedValue([config, other]);
   api.connect.mockResolvedValue("other-session");
   render(<App />);
-  await waitFor(() =>
-    expect(
-      screen.getByRole("button", { name: "Remove Other server" }),
-    ).toBeTruthy(),
-  );
+  await waitFor(() => expect(api.listProfiles).toHaveBeenCalled());
+  expect(
+    screen.queryByRole("button", { name: "Remove Other server" }),
+  ).toBeNull();
   await connectionMenu();
   fireEvent.click(
     screen.getByRole("menuitem", { name: "Switch Connection Profile" }),

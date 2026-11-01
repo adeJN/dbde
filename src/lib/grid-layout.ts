@@ -1,7 +1,7 @@
 import { isMacPlatform } from "./table-shortcuts";
 
 /** Shared by virtualization, page-key navigation and the grid's CSS row height. */
-export const GRID_ROW_HEIGHT = 32;
+export const GRID_ROW_HEIGHT = 28;
 
 /**
  * Which result columns the data grid shows, and in which order. Hidden columns are not

@@ -24,6 +24,7 @@ export default function DatabaseDialog({
   const [error, setError] = useState("");
   const root = useRef<HTMLElement>(null);
   const mysql = r.session.config.driver === "mysql";
+  const renaming = r.mode === "edit" && name.trim() !== r.database;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
     root.current
@@ -40,7 +41,7 @@ export default function DatabaseDialog({
     api
       .execute(
         r.session.id,
-        "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()",
+        "SELECT CONVERT(DEFAULT_CHARACTER_SET_NAME USING utf8mb4), CONVERT(DEFAULT_COLLATION_NAME USING utf8mb4) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = DATABASE()",
         r.database,
       )
       .then((result) => {
@@ -131,16 +132,25 @@ export default function DatabaseDialog({
               required
               value={name}
               maxLength={mysql ? 64 : 63}
-              readOnly={mysql && r.mode === "edit"}
               onChange={(e) => setName(e.target.value)}
             />
           </label>
+          {mysql && r.mode === "edit" && (
+            <p className="table-tools-note">
+              Changing the name moves InnoDB tables to a new database and
+              removes the empty source. Views, triggers, routines, events and
+              cross-database foreign keys require a separate migration. Stop
+              other writers and back up your database first. Applications and
+              grants using the old name must be updated separately. Database
+              defaults are preserved when renaming.
+            </p>
+          )}
           {mysql && (
             <>
               <label>
                 Character set
                 <input
-                  disabled={busy}
+                  disabled={busy || loading || renaming}
                   value={charset}
                   placeholder="Server default"
                   pattern="[A-Za-z0-9_]*"
@@ -150,7 +160,7 @@ export default function DatabaseDialog({
               <label>
                 Collation
                 <input
-                  disabled={busy}
+                  disabled={busy || loading || renaming}
                   value={collation}
                   placeholder="Default for character set"
                   pattern="[A-Za-z0-9_]*"
@@ -191,7 +201,9 @@ export default function DatabaseDialog({
                 ? "Saving…"
                 : r.mode === "create"
                   ? "Create Database"
-                  : "Save Changes"}
+                  : name.trim() !== r.database
+                    ? "Rename Database…"
+                    : "Save Changes"}
             </button>
           </footer>
         </form>

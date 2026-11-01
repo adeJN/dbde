@@ -222,7 +222,8 @@ pub(crate) async fn primary_keys(conn: &Connection, table: &TableInfo) -> DbResu
         Pool::Pg(p) => sqlx::query_scalar::<_, String>("SELECT k.column_name FROM information_schema.table_constraints t JOIN information_schema.key_column_usage k ON k.constraint_name = t.constraint_name AND k.constraint_schema = t.constraint_schema AND k.table_name = t.table_name WHERE t.constraint_type = 'PRIMARY KEY' AND t.table_schema = $1 AND t.table_name = $2 ORDER BY k.ordinal_position").bind(&table.schema).bind(&table.name).fetch_all(p).await.map_err(err),
         Pool::My(p) => {
             if table.schema != conn.config.database { return Err("Table does not belong to the selected database".into()); }
-            sqlx::query_scalar::<_, String>("SELECT column_name FROM information_schema.key_column_usage WHERE table_schema = DATABASE() AND table_name = ? AND constraint_name = 'PRIMARY' ORDER BY ordinal_position").bind(&table.name).fetch_all(p).await.map_err(err)
+            let rows = sqlx::query("SELECT column_name FROM information_schema.key_column_usage WHERE table_schema = DATABASE() AND table_name = ? AND constraint_name = 'PRIMARY' ORDER BY ordinal_position").bind(&table.name).fetch_all(p).await.map_err(err)?;
+            rows.iter().map(|row| mysql_metadata_text(row, 0)).collect()
         },
         Pool::Lite(p) => {
             if !table.schema.is_empty() && table.schema != "main" { return Err("Only the main SQLite database supports row actions".into()); }

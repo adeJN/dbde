@@ -1079,6 +1079,25 @@ async fn dbde_execute_query(
 fn mysql_metadata_text(row: &sqlx::mysql::MySqlRow, index: usize) -> DbResult<String> {
     row.try_get_unchecked::<String, _>(index).map_err(err)
 }
+// Only catalog queries may treat binary-labelled text as metadata. Record
+// results continue to use my_cell so real BLOB/VARBINARY values remain bytes.
+fn mysql_metadata_cell(row: &sqlx::mysql::MySqlRow, index: usize) -> DbResult<Value> {
+    if row.try_get_raw(index).map_err(err)?.is_null() {
+        return Ok(Value::Null);
+    }
+    match row.columns()[index].type_info().name() {
+        "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" => {
+            mysql_metadata_text(row, index).map(Value::String)
+        }
+        _ => my_cell(row, index),
+    }
+}
+async fn metadata_query(pool: &Pool, sql: &str, params: &[String]) -> DbResult<QueryResult> {
+    match pool {
+        Pool::My(pool) => query_pool!(pool, sql, mysql_metadata_cell, params),
+        _ => query_with_params(pool, sql, params).await,
+    }
+}
 async fn mysql_database_names(pool: &sqlx::MySqlPool) -> DbResult<Vec<String>> {
     let rows = sqlx::query("SHOW DATABASES")
         .fetch_all(pool)
@@ -1164,7 +1183,7 @@ async fn load_schema_tree(
     } else {
         Vec::new()
     };
-    let result = timed(query_with_params(&conn.pool, sql, &params)).await?;
+    let result = timed(metadata_query(&conn.pool, sql, &params)).await?;
     let tables = result
         .rows
         .iter()
@@ -1970,12 +1989,73 @@ mod tests {
             my_cell(&row, 0).unwrap(),
             json!({"hex": "646174616261736520636166c3a9"})
         );
+        assert_eq!(
+            mysql_metadata_cell(&row, 0).unwrap(),
+            json!("database café")
+        );
+        assert_eq!(mysql_metadata_cell(&row, 2).unwrap(), Value::Null);
+        assert!(mysql_metadata_cell(&row, 3).is_err());
+        let catalog = metadata_query(&Pool::My(pool.clone()),
+            "SELECT CAST('tabel café' AS BINARY) AS table_name, CAST('database test' AS BINARY) AS table_schema, CAST('VIEW' AS BINARY) AS table_type, 7 AS table_rows, CAST(NULL AS BINARY) AS comment",
+            &[]).await.unwrap();
+        assert_eq!(
+            catalog.rows[0],
+            vec![
+                json!("tabel café"),
+                json!("database test"),
+                json!("VIEW"),
+                json!(7),
+                Value::Null
+            ]
+        );
         let expected = mysql_database_names(&pool).await.unwrap();
         sqlx::query("SET SESSION character_set_results = binary")
             .execute(&pool)
             .await
             .unwrap();
         assert_eq!(mysql_database_names(&pool).await.unwrap(), expected);
+        let mut config = config(Driver::Mysql);
+        config.database = sqlx::mysql::MySqlConnectOptions::from_str(&url)
+            .unwrap()
+            .get_database()
+            .unwrap()
+            .to_string();
+        let database = config.database.clone();
+        let conn = Connection {
+            tunnel: None,
+            pool: Pool::My(pool.clone()),
+            config,
+            databases: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let state = AppState {
+            connections: Mutex::new(HashMap::from([("server".into(), conn.clone())])),
+            profiles: Mutex::new(()),
+            profile_path: PathBuf::new(),
+        };
+        let catalog = load_schema_tree(&state, "server", Some(&database))
+            .await
+            .unwrap();
+        assert!(
+            !catalog.tables.is_empty(),
+            "Use a test database with tables"
+        );
+        assert!(
+            catalog
+                .tables
+                .iter()
+                .all(|table| !table.name.is_empty() && table.schema == database),
+            "Binary catalog metadata must not become blank table names"
+        );
+        let table = catalog
+            .tables
+            .iter()
+            .find(|table| table.kind == "table")
+            .unwrap();
+        let columns = column_meta::table_columns(&conn.pool, table).await.unwrap();
+        assert!(!columns.is_empty());
+        assert!(columns.iter().all(|column| !column.name.is_empty()));
+        rows::primary_keys(&conn, table).await.unwrap();
         pool.close().await;
     }
     #[tokio::test]

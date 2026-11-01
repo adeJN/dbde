@@ -41,6 +41,9 @@ import {
   RefreshCw,
   Unplug,
   CircleHelp,
+  CircleCheck,
+  CircleAlert,
+  Info,
   Terminal,
   Layers,
   ArrowUpRight,
@@ -1087,6 +1090,10 @@ export default function App() {
     return () => window.removeEventListener("keydown", design, true);
   }, [tab, session]);
   const [profiles, setProfiles] = useState<ConnectionConfig[]>([]);
+  const closedProfiles = profiles.filter(
+    (profile) =>
+      !w.sessions.some((session) => session.config.id === profile.id),
+  );
   const autoConnectAttempted = useRef(new Set<string>());
   const [connectionMenu, setConnectionMenu] =
     useState<ConnectionMenuTarget | null>(null);
@@ -2941,24 +2948,92 @@ export default function App() {
   async function saveDatabase(change: api.DatabaseChange) {
     const request = databaseDialog!;
     const { session, database, mode } = request;
-    if (
-      mode === "edit" &&
-      session.config.driver === "postgres" &&
-      !(await prepareDatabaseClose(session, database))
-    )
+    const renaming = mode === "edit" && change.name !== database;
+    if (renaming && session.config.driver === "mysql") {
+      if (
+        !(await confirmAction({
+          title: `Rename database ${database}?`,
+          body: "This creates the destination, moves supported InnoDB tables and deletes the empty source database. Stop other writers and back up first. Views, triggers, routines, events and cross-database foreign keys block this operation. Update external applications, SQL references and database grants separately. If a step fails, both databases may remain; refresh and inspect before retrying.",
+          confirmLabel: "Rename Database",
+          details: [`${database} → ${change.name}`],
+        }))
+      )
+        throw new Error("Rename cancelled. No database changes were applied.");
+    }
+    if (renaming && !(await prepareDatabaseClose(session, database)))
       throw new Error("Rename cancelled. No database changes were applied.");
-    await api.manageDatabase(session.id, database, mode, change);
+    try {
+      await api.manageDatabase(session.id, database, mode, change);
+    } catch (cause) {
+      if (renaming) await refresh(session.id).catch(() => {});
+      throw cause;
+    }
     let profileWarning = "";
-    if (mode === "edit" && session.config.driver === "postgres") {
+    if (renaming) {
       clearDatabaseTabs(session, database);
       setShortcuts((old) =>
         old.map((item) =>
           item.profile_id === session.config.id && item.database === database
-            ? { ...item, database: change.name }
+            ? {
+                ...item,
+                database: change.name,
+                table: {
+                  ...item.table,
+                  schema:
+                    session.config.driver === "mysql"
+                      ? change.name
+                      : item.table.schema,
+                },
+              }
             : item,
         ),
       );
-      profileWarning = await updateInitialDatabase(
+      setFavorites((old) =>
+        old.map((item) => {
+          if (
+            item.profile_id !== session.config.id ||
+            item.database !== database
+          )
+            return item;
+          const table =
+            item.table && session.config.driver === "mysql"
+              ? { ...item.table, schema: change.name }
+              : item.table;
+          return {
+            ...item,
+            database: change.name,
+            table,
+            name:
+              item.kind === "database" && item.name === database
+                ? change.name
+                : item.name,
+            id:
+              item.kind === "query"
+                ? item.id
+                : JSON.stringify([
+                    session.config.id,
+                    item.kind,
+                    change.name,
+                    table?.schema,
+                    table?.name,
+                  ]),
+          };
+        }),
+      );
+      const saved = savedQueriesRef.current.filter(
+        (item) =>
+          item.profile_id === session.config.id && item.database === database,
+      );
+      if (saved.length) {
+        try {
+          await library.saveQueries(
+            saved.map((item) => ({ ...item, database: change.name })),
+          );
+        } catch (cause) {
+          profileWarning += ` Saved query connections could not be updated: ${String(cause)}`;
+        }
+      }
+      profileWarning += await updateInitialDatabase(
         session,
         database,
         change.name,
@@ -4080,10 +4155,10 @@ export default function App() {
                   </p>
                 </div>
               )}
-              {profiles.length > 0 && (
+              {closedProfiles.length > 0 && (
                 <>
                   <div className="saved-heading">SAVED CONNECTIONS</div>
-                  {profiles.map((p) => (
+                  {closedProfiles.map((p) => (
                     <div
                       className="saved-row"
                       key={p.id}
@@ -4245,7 +4320,22 @@ export default function App() {
               className={`notice ${noticeState.tone}`}
               role={noticeState.tone === "error" ? "alert" : "status"}
             >
-              {notice}
+              {noticeState.tone === "success" ? (
+                <CircleCheck
+                  className="notice-icon"
+                  size={16}
+                  aria-hidden="true"
+                />
+              ) : noticeState.tone === "error" ? (
+                <CircleAlert
+                  className="notice-icon"
+                  size={16}
+                  aria-hidden="true"
+                />
+              ) : (
+                <Info className="notice-icon" size={16} aria-hidden="true" />
+              )}
+              <span className="notice-text">{notice}</span>
               <button
                 className="icon-button"
                 onClick={() => setNotice("")}
