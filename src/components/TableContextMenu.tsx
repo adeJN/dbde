@@ -58,6 +58,7 @@ export default function TableContextMenu({
   onClose,
   clipboardActions,
   maintain,
+  deleteCount = 1,
 }: {
   table: TableInfo;
   target: TableMenuTarget;
@@ -65,6 +66,7 @@ export default function TableContextMenu({
   onClose: () => void;
   clipboardActions?: { copy: () => void; paste: () => void; canPaste: boolean };
   maintain?: MaintainMenu;
+  deleteCount?: number;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const subRef = useRef<HTMLDivElement>(null);
@@ -334,7 +336,9 @@ export default function TableContextMenu({
         {item("Empty table…", "empty", <Eraser size={12} />, isView)}
         {item("Truncate…", "truncate", <Eraser size={12} />, isView)}
         {item(
-          `Drop ${isView ? "view" : "table"}…`,
+          deleteCount > 1
+            ? `Delete ${deleteCount} selected tables…`
+            : `Drop ${isView ? "view" : "table"}…`,
           "drop",
           <Trash2 size={12} />,
         )}

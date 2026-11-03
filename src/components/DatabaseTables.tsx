@@ -13,6 +13,7 @@ import {
   RefreshCw,
   Search,
   Table2,
+  Trash2,
 } from "lucide-react";
 import type { SchemaTree, Session, TableInfo } from "../types";
 import { useWorkspace } from "../store";
@@ -46,6 +47,7 @@ export default function DatabaseTables({
   onOpen,
   onCreate,
   onAction,
+  onDelete,
   onCopy,
   onPaste,
   onQuery,
@@ -59,6 +61,7 @@ export default function DatabaseTables({
   onOpen: (table: TableInfo) => void;
   onCreate: () => void;
   onAction: (table: TableInfo, action: TableAction) => void;
+  onDelete?: (tables: TableInfo[]) => void;
   onCopy?: (tables: TableInfo[]) => void;
   onPaste?: (text?: string) => void;
   canPaste?: boolean;
@@ -312,7 +315,8 @@ export default function DatabaseTables({
         ) {
           event.preventDefault();
           event.stopPropagation();
-          if (selectedTables.length > 1)
+          if (onDelete && selectedTables.length) onDelete(selectedTables);
+          else if (selectedTables.length > 1)
             setHint(
               "Delete one table at a time using its permanent-delete confirmation.",
             );
@@ -382,6 +386,23 @@ export default function DatabaseTables({
             <ClipboardPaste size={15} />
           </button>
         </div>
+        {onDelete && (
+          <div
+            className="toolbar-group"
+            role="group"
+            aria-label="Delete tables"
+          >
+            <button
+              className="icon-button"
+              aria-label="Delete selected tables"
+              title={`Delete ${selectedTables.length || "selected"} table(s)`}
+              disabled={loading || !selectedTables.length}
+              onClick={() => onDelete(selectedTables)}
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        )}
         {onTool &&
           TOOL_GROUPS.map((group) => (
             <div
@@ -438,7 +459,7 @@ export default function DatabaseTables({
       ) : (
         <div
           ref={list}
-          className="database-tables-scroll"
+          className={`database-tables-scroll${!tables.length && !error ? " is-empty" : ""}`}
           tabIndex={tables.length ? -1 : 0}
           onClick={(event) => {
             if (event.target === event.currentTarget)
@@ -608,7 +629,20 @@ export default function DatabaseTables({
           table={menu.table}
           target={menu.target}
           onClose={() => setMenu(null)}
-          onAction={(action) => onAction(menu.table, action)}
+          onAction={(action) =>
+            action === "drop" && onDelete
+              ? onDelete(
+                  selected.includes(tableKey(menu.table))
+                    ? selectedTables
+                    : [menu.table],
+                )
+              : onAction(menu.table, action)
+          }
+          deleteCount={
+            onDelete && selected.includes(tableKey(menu.table))
+              ? selectedTables.length
+              : 1
+          }
           clipboardActions={
             onCopy && onPaste
               ? { copy: copySelection, paste: () => onPaste(), canPaste }

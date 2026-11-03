@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import * as api from "../lib/api";
+import { useProcessReports, processFailure } from "../lib/process-reports";
 import { mappedRecords, readTable } from "../lib/table-tools";
 import { modelTableKey } from "../lib/database-model";
 import type { Session, TableInfo } from "../types";
@@ -33,6 +34,7 @@ export default function DataTransfer({
   const stop = useRef(false),
     lock = useRef(false),
     completed = useRef(new Set<string>());
+  const operationId = useRef<string>();
   const target = sessions.find((s) => s.id === targetId);
   useEffect(() => {
     setTargetDb(target?.databases?.[0] ?? target?.config.database ?? "");
@@ -80,6 +82,11 @@ export default function DataTransfer({
     setBusy(true);
     onBusy(true);
     setError("");
+    const reports = useProcessReports.getState();
+    const reportId = reports.start(
+      "Data transfer",
+      `${database} → ${target.config.name} / ${targetDb}`,
+    );
     try {
       const tasks = [];
       for (const table of tables.filter(
@@ -128,22 +135,49 @@ export default function DataTransfer({
       }
       for (const task of tasks) {
         if (stop.current) break;
-        const result = await readTable(
-          session.id,
-          database,
-          task.table,
-          session.config.driver,
-          5000,
-        );
-        const changes = mappedRecords(result, task.mapping);
-        const count = changes.length
-          ? await api.applyChanges(
-              targetId,
-              { database: targetDb, table: task.destination, primary_keys: [] },
-              changes,
-            )
-          : 0;
+        reports.progress(reportId, `Reading ${task.table.name}`);
+        operationId.current = crypto.randomUUID();
+        let count: number;
+        if (api.desktop) {
+          count = await api.transferRecords(
+            session.id,
+            database,
+            task.table,
+            targetId,
+            targetDb,
+            task.destination,
+            task.mapping,
+            operationId.current,
+          );
+        } else {
+          const result = await readTable(
+            session.id,
+            database,
+            task.table,
+            session.config.driver,
+            5000,
+            (rows) =>
+              reports.progress(reportId, `Reading ${task.table.name}`, rows),
+          );
+          const changes = mappedRecords(result, task.mapping);
+          count = changes.length
+            ? await api.applyChanges(
+                targetId,
+                {
+                  database: targetDb,
+                  table: task.destination,
+                  primary_keys: [],
+                },
+                changes,
+              )
+            : 0;
+        }
+        operationId.current = undefined;
         completed.current.add(modelTableKey(task.table));
+        reports.progress(
+          reportId,
+          `${task.table.name} → ${task.destination.name}: ${count} records transferred`,
+        );
         setLog((old) => [
           ...old,
           `${task.table.name} → ${task.destination.name}: ${count} records transferred.`,
@@ -155,12 +189,21 @@ export default function DataTransfer({
           ? "Stopped between tables. Completed tables are retained."
           : "Transfer complete.",
       ]);
+      reports.finish(
+        reportId,
+        stop.current ? "cancelled" : "success",
+        stop.current
+          ? "Stopped between tables; completed tables retained"
+          : "Transfer complete",
+      );
     } catch (e) {
+      reports.finish(reportId, "error", processFailure(e));
       setError(
         `${String(e)} Completed tables are retained and skipped on retry.`,
       );
     } finally {
       if (completed.current.size) onChanged();
+      operationId.current = undefined;
       lock.current = false;
       setBusy(false);
       onBusy(false);
@@ -171,9 +214,10 @@ export default function DataTransfer({
       <p className="admin-muted">
         Append records from several tables to existing tables on another
         connection or server, including different engines. Fields match by name.
-        Each table is atomic, with a limit of 5,000 scalar records; use
-        export/import for larger or binary transfers. Existing destination
-        records are retained.
+        Each table is atomic. Desktop transfers stream through a private
+        temporary file (up to 5,000,000 rows / 512 MB); the browser sandbox
+        supports 5,000 scalar records. Binary transfers require export/import.
+        Existing destination records are retained.
       </p>
       <div className="admin-row">
         <label>
@@ -304,9 +348,13 @@ export default function DataTransfer({
             className="button"
             onClick={() => {
               stop.current = true;
+              if (operationId.current && api.desktop)
+                void api
+                  .cancelOperation(operationId.current)
+                  .catch((cause) => setError(String(cause)));
             }}
           >
-            Stop after current table
+            Cancel transfer
           </button>
         )}
       </div>

@@ -165,7 +165,16 @@ export default function HelpDialog({ onClose }: { onClose: () => void }) {
       title: "Query & tabs",
       note: "Run SQL from the query editor. Use the tab strip to manage open tabs.",
       rows: [
-        ["Run query or selected SQL", `${command}Enter`],
+        ["Run checked queries / current statement", `${command}Enter`],
+        [
+          "Run current statement or selection",
+          mac ? "⇧⌘Enter" : "Ctrl+Shift+Enter",
+        ],
+        ["Run entire SQL script", mac ? "⌥⌘Enter" : "Ctrl+Alt+Enter"],
+        ["Format SQL or selection", mac ? "⇧⌥F" : "Shift+Alt+F"],
+        ["Toggle line comment", `${command}/`],
+        ["Go to line", "Ctrl+G"],
+        ["Trigger SQL suggestions", "Ctrl+Space"],
         [
           "Explain statement under cursor or selection (SQL editor focused)",
           mac ? "⇧⌘E" : "Ctrl+Shift+E",

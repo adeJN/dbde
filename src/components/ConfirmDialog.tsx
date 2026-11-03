@@ -9,6 +9,7 @@ export interface ConfirmRequest {
   /** Statements or names to show verbatim, such as the SQL about to run. */
   details?: string[];
   tableDeletion?: {
+    targets?: string[];
     allowForeignKeyChecks: boolean;
     onForeignKeyChecks: (mode: ForeignKeyChecks) => void;
   };
@@ -95,6 +96,19 @@ export default function ConfirmDialog({
         <h2 id="confirm-title">{request.title}</h2>
         {request.tableDeletion ? (
           <>
+            {request.tableDeletion.targets && (
+              <div
+                className="delete-bulk-targets"
+                aria-label="Tables to delete"
+              >
+                <p>{request.body}</p>
+                <ul>
+                  {request.tableDeletion.targets.map((name) => (
+                    <li key={name}>{name}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
             <label className="delete-foreign-keys">
               <span>Foreign Key Checks</span>
               <span className="delete-select-wrap">

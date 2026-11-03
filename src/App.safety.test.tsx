@@ -11,6 +11,7 @@ import {
 } from "@testing-library/react";
 import App from "./App";
 import { useWorkspace } from "./store";
+import { useProcessReports } from "./lib/process-reports";
 import type { ConnectionConfig } from "./types";
 const api = vi.hoisted(() => ({
   execute: vi.fn(),
@@ -45,6 +46,7 @@ const api = vi.hoisted(() => ({
   renameTableFields: vi.fn(),
   alterTableFields: vi.fn(),
   pasteTable: vi.fn(),
+  pasteTables: vi.fn(),
   viewTable: vi.fn(),
   schema: vi.fn(),
   listProfiles: vi.fn(),
@@ -55,6 +57,7 @@ const api = vi.hoisted(() => ({
   deleteProfile: vi.fn(),
   moveTabToWindow: vi.fn(),
   closeDetachedWindow: vi.fn(),
+  guardMainWindowClose: vi.fn().mockResolvedValue(() => {}),
   guardDetachedWindowClose: vi.fn(),
   listHistory: vi.fn(),
   appendHistory: vi.fn(),
@@ -137,6 +140,12 @@ it("auto-connects saved profiles once and uses their default query timeout", asy
   ).toBe(75);
 });
 beforeEach(() => {
+  useProcessReports.setState({
+    reports: [],
+    notifications: [],
+    selectedId: undefined,
+    open: false,
+  });
   const storage = new Map<string, string>();
   vi.stubGlobal("localStorage", {
     getItem: (key: string) => storage.get(key) ?? null,
@@ -144,6 +153,7 @@ beforeEach(() => {
     removeItem: (key: string) => storage.delete(key),
   });
   for (const fn of Object.values(api)) fn.mockReset();
+  api.guardMainWindowClose.mockResolvedValue(() => {});
   api.execute.mockResolvedValue({
     columns: [],
     rows: [],
@@ -173,6 +183,91 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 const dialog = () => screen.getByRole("alertdialog");
+async function selectTablesForDeletion() {
+  workspace("SELECT 1");
+  const targets = [
+    table,
+    { ...table, name: "orders" },
+    { ...table, name: "notes" },
+  ];
+  const tree = { database: "app", tables: targets };
+  api.schema.mockResolvedValue(tree);
+  useWorkspace.getState().updateSession("pg", { trees: { app: tree } });
+  useWorkspace.getState().openDatabaseTab("pg", "app");
+  render(<App />);
+  const list = await screen.findByRole("table", { name: "Table list for app" });
+  fireEvent.click(within(list).getByRole("button", { name: "customers" }));
+  fireEvent.keyDown(within(list).getByRole("button", { name: "customers" }), {
+    key: "a",
+    metaKey: /Mac|iPhone|iPad/.test(navigator.platform),
+    ctrlKey: !/Mac|iPhone|iPad/.test(navigator.platform),
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Delete selected tables" }),
+  );
+  return targets;
+}
+it("shows every bulk-delete target and requires acknowledgement before deleting", async () => {
+  const targets = await selectTablesForDeletion();
+  const prompt = await screen.findByRole("alertdialog");
+  for (const target of targets)
+    expect(within(prompt).getByText(`app.public.${target.name}`)).toBeTruthy();
+  const remove = within(prompt).getByRole("button", {
+    name: "Delete 3 objects",
+  }) as HTMLButtonElement;
+  expect(remove.disabled).toBe(true);
+  fireEvent.click(remove);
+  expect(api.dropTable).not.toHaveBeenCalled();
+  fireEvent.click(
+    within(prompt).getByRole("checkbox", { name: /I understand/ }),
+  );
+  fireEvent.click(remove);
+  await waitFor(() => expect(api.dropTable).toHaveBeenCalledTimes(3));
+  await waitFor(() =>
+    expect(useProcessReports.getState().reports[0].status).toBe("success"),
+  );
+  expect(
+    useProcessReports
+      .getState()
+      .reports.find((r) => r.title === "Delete tables")?.stage,
+  ).toBe("3/3 objects deleted");
+});
+it("cancels bulk deletion without sending any DROP request", async () => {
+  await selectTablesForDeletion();
+  fireEvent.click(
+    within(await screen.findByRole("alertdialog")).getByRole("button", {
+      name: "Cancel",
+    }),
+  );
+  expect(api.dropTable).not.toHaveBeenCalled();
+  expect(useProcessReports.getState().reports).toHaveLength(0);
+});
+it("stops bulk deletion at the first failure and reports unattempted tables", async () => {
+  api.dropTable
+    .mockResolvedValueOnce(undefined)
+    .mockRejectedValueOnce(new Error("Foreign key constraint"));
+  await selectTablesForDeletion();
+  const prompt = await screen.findByRole("alertdialog");
+  fireEvent.click(
+    within(prompt).getByRole("checkbox", { name: /I understand/ }),
+  );
+  fireEvent.click(
+    within(prompt).getByRole("button", { name: "Delete 3 objects" }),
+  );
+  await waitFor(() =>
+    expect(useProcessReports.getState().reports[0]?.status).toBe("error"),
+  );
+  expect(api.dropTable).toHaveBeenCalledTimes(2);
+  const report = useProcessReports
+    .getState()
+    .reports.find((r) => r.title === "Delete tables")!;
+  expect(report.stage).toContain("1/3");
+  expect(
+    report.log.some(
+      (entry) => entry.text === "Not attempted: app.public.notes",
+    ),
+  ).toBe(true);
+});
 describe("safety prompts", () => {
   it("asks before running destructive SQL and then runs it on the tab's session", async () => {
     workspace("DELETE FROM customers;");
@@ -1039,7 +1134,7 @@ it("opens the table designer from the database sidebar", async () => {
   workspace("SELECT 1");
   render(<App />);
   fireEvent.click(screen.getByRole("button", { name: "New table in app" }));
-  expect(screen.getByRole("dialog", { name: /New Table/ })).toBeTruthy();
+  expect(await screen.findByRole("dialog", { name: /New Table/ })).toBeTruthy();
   expect(screen.getByRole("tab", { name: /Fields/ })).toBeTruthy();
   expect(
     screen.getByRole("textbox", { name: "Table schema" }).getAttribute("value"),
@@ -1063,7 +1158,7 @@ it("creates a table, refreshes the sidebar tree and opens its data tab", async (
   });
   render(<App />);
   fireEvent.click(screen.getByRole("button", { name: "New table in app" }));
-  fireEvent.change(screen.getByRole("textbox", { name: "Table name" }), {
+  fireEvent.change(await screen.findByRole("textbox", { name: "Table name" }), {
     target: { value: "new_customers" },
   });
   fireEvent.click(
@@ -2080,7 +2175,7 @@ it("copies a table from one database list and pastes it into another database af
     database,
     tables: database === "app" ? [mysqlTable] : [],
   }));
-  api.pasteTable.mockResolvedValue(undefined);
+  api.pasteTables.mockResolvedValue(undefined);
   render(<App />);
   fireEvent.click(
     within(screen.getByRole("complementary")).getByRole("button", {
@@ -2093,7 +2188,7 @@ it("copies a table from one database list and pastes it into another database af
   fireEvent.click(row);
   fireEvent.keyDown(row, { key: "c", metaKey: true });
   await waitFor(() => expect(writeText).toHaveBeenCalledWith("customers"));
-  expect(api.pasteTable).not.toHaveBeenCalled();
+  expect(api.pasteTables).not.toHaveBeenCalled();
   fireEvent.click(
     within(screen.getByRole("complementary")).getByRole("button", {
       name: "other",
@@ -2107,17 +2202,23 @@ it("copies a table from one database list and pastes it into another database af
   await within(dialog).findByRole("textbox", {
     name: "Target name for customers",
   });
-  expect(api.pasteTable).not.toHaveBeenCalled();
+  expect(api.pasteTables).not.toHaveBeenCalled();
   fireEvent.click(within(dialog).getByRole("button", { name: "Paste tables" }));
   await waitFor(() =>
-    expect(api.pasteTable).toHaveBeenCalledWith(
+    expect(api.pasteTables).toHaveBeenCalledWith(
       "pg",
       "app",
-      mysqlTable,
       "target",
       "other",
-      { name: "customers", schema: "other", kind: "table" },
+      [
+        {
+          table: mysqlTable,
+          target: { name: "customers", schema: "other", kind: "table" },
+        },
+      ],
       true,
+      expect.any(String),
+      expect.any(Function),
     ),
   );
   await waitFor(() =>
@@ -2585,4 +2686,136 @@ it("opens active table design when focus returns to the page after a table list 
   expect(
     await screen.findByRole("button", { name: "Close table design" }),
   ).toBeTruthy();
+});
+
+it("registers a main-window close guard and blocks closing during a running operation", async () => {
+  workspace("SELECT 1");
+  render(<App />);
+  await waitFor(() => expect(api.guardMainWindowClose).toHaveBeenCalled());
+  const approve = api.guardMainWindowClose.mock.calls.at(-1)![0];
+  useProcessReports.getState().start("Copy table");
+  let allowed;
+  await act(async () => {
+    allowed = await approve();
+  });
+  expect(allowed).toBe(false);
+  expect(await screen.findByText(/Wait for running operations/)).toBeTruthy();
+});
+it("asks about unsaved SQL before approving the main window close", async () => {
+  workspace("SELECT 42");
+  useWorkspace.getState().updateTab("tab-1", {
+    savedQueryId: "query-one",
+    savedQuerySql: "SELECT 1",
+  });
+  render(<App />);
+  await waitFor(() => expect(api.guardMainWindowClose).toHaveBeenCalled());
+  const approve = api.guardMainWindowClose.mock.calls.at(-1)![0];
+  let pending!: Promise<boolean>;
+  act(() => {
+    pending = approve();
+  });
+  const dialog = await screen.findByRole("alertdialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  expect(await pending).toBe(false);
+});
+it("keeps the app open while a table design dialog needs review", async () => {
+  workspace("SELECT 1");
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "New table in app" }));
+  await screen.findByRole("dialog", { name: /New Table/ });
+  const approve = api.guardMainWindowClose.mock.calls.at(-1)![0];
+  let allowed;
+  await act(async () => {
+    allowed = await approve();
+  });
+  expect(allowed).toBe(false);
+  expect(
+    await screen.findByText(/Close the table designer first/),
+  ).toBeTruthy();
+});
+
+it.each([null, new Error("Access denied to transaction metadata")])(
+  "requires explicit confirmation when transaction status is unknown: %s",
+  async (status) => {
+    workspace("BEGIN; UPDATE customers SET name = 'edited' WHERE id = 1;");
+    if (status instanceof Error)
+      api.sessionInTransaction.mockRejectedValue(status);
+    else api.sessionInTransaction.mockResolvedValue(status);
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Close Cleanup" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain(
+      "Transaction status could not be verified",
+    );
+    expect(dialog.textContent).toContain("Cleanup: transaction status unknown");
+    expect(api.closeSession).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(useWorkspace.getState().tabs).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Close Cleanup" }));
+    fireEvent.click(
+      within(await screen.findByRole("alertdialog")).getByRole("button", {
+        name: "Close and discard pending transactions",
+      }),
+    );
+    await waitFor(() => expect(useWorkspace.getState().tabs).toHaveLength(0));
+    expect(api.closeSession).toHaveBeenCalledWith("pg", "tab-1");
+  },
+);
+
+it("refreshes only the last executed subset in a detached query window", async () => {
+  workspace("SELECT 1; INSERT INTO customers (name) VALUES ('must not run');");
+  useWorkspace.getState().updateTab("tab-1", {
+    lastExecutedQuery: "SELECT 1;",
+    result: {
+      columns: ["value"],
+      rows: [[1]],
+      affected_rows: 0,
+      execution_ms: 1,
+      truncated: false,
+    },
+  });
+  window.history.replaceState(null, "", "#detached");
+  useWorkspace.setState({ singleTab: true });
+  try {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh results" }));
+    await waitFor(() =>
+      expect(api.execute).toHaveBeenCalledWith(
+        "pg",
+        "SELECT 1;",
+        "app",
+        "tab-1",
+        600,
+      ),
+    );
+    expect(useWorkspace.getState().tabs[0].lastExecutedQuery).toBe("SELECT 1;");
+  } finally {
+    window.history.replaceState(null, "", "/");
+  }
+});
+
+it("refuses detached refresh if the original executed SQL is unavailable", async () => {
+  workspace("SELECT 1; INSERT INTO customers (name) VALUES ('must not run');");
+  useWorkspace.getState().updateTab("tab-1", {
+    result: {
+      columns: ["value"],
+      rows: [[1]],
+      affected_rows: 0,
+      execution_ms: 1,
+      truncated: false,
+    },
+  });
+  window.history.replaceState(null, "", "#detached");
+  useWorkspace.setState({ singleTab: true });
+  try {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Refresh results" }));
+    expect(
+      await screen.findByText(/original executed SQL is unavailable/),
+    ).toBeTruthy();
+    expect(api.execute).not.toHaveBeenCalled();
+  } finally {
+    window.history.replaceState(null, "", "/");
+  }
 });

@@ -12,7 +12,8 @@
     "format": "prettier --write src vite.config.ts tsconfig.json package.json index.html src-tauri/tauri.conf.json src-tauri/capabilities/default.json README.md",
     "format:check": "prettier --check src vite.config.ts tsconfig.json package.json index.html src-tauri/tauri.conf.json src-tauri/capabilities/default.json README.md",
     "release:build": "node scripts/release-build.mjs",
-    "updater:manifest": "node scripts/update-manifest.mjs"
+    "updater:manifest": "node scripts/update-manifest.mjs",
+    "clean:cache": "node scripts/clean-build-cache.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

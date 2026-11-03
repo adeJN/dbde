@@ -24,6 +24,7 @@ const api = vi.hoisted(() => ({
   columns: vi.fn(),
   listDatabases: vi.fn(),
   disconnect: vi.fn(),
+  guardMainWindowClose: vi.fn().mockResolvedValue(() => {}),
   guardDetachedWindowClose: vi.fn(),
   listHistory: vi.fn(),
   appendHistory: vi.fn(),
@@ -86,6 +87,7 @@ beforeEach(() => {
     removeItem: (key: string) => storage.delete(key),
   });
   for (const fn of Object.values(api)) fn.mockReset();
+  api.guardMainWindowClose.mockResolvedValue(() => {});
   api.execute.mockResolvedValue({
     columns: ["id"],
     rows: [[1], [2]],

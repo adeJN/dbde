@@ -471,6 +471,8 @@ it("sends source and destination database identities when pasting a table", asyn
     target,
     data: true,
     destination: { connectionId: "target", database: "archive" },
+    operationId: expect.any(String),
+    onProgress: expect.anything(),
   });
 });
 

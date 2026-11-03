@@ -1409,7 +1409,15 @@ impl Importer {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        let mut sql = format!("INSERT INTO {} ({names}) VALUES {tuples}", self.target);
+        let identity = if matches!(self.driver, Driver::Postgres) {
+            " OVERRIDING SYSTEM VALUE"
+        } else {
+            ""
+        };
+        let mut sql = format!(
+            "INSERT INTO {} ({names}){identity} VALUES {tuples}",
+            self.target
+        );
         if self.mode == ImportMode::Upsert {
             let others = self.others();
             let keys = self
@@ -1903,6 +1911,37 @@ pub(crate) fn dbde_cancel_import(import_id: String, imports: State<'_, Imports>)
         flag.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+pub(crate) async fn transfer_file(
+    conn: &Connection,
+    table: &TableInfo,
+    path: &Path,
+    mapping: Value,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> DbResult<u64> {
+    if !target_info(conn, table).await?.transactional {
+        return Err("Transfers require a transactional destination (InnoDB for MySQL); no records were written.".into());
+    }
+    let request: ImportRequest = serde_json::from_value(json!({
+        "options":{"format":"json", "header":true}, "mapping":mapping,
+        "mode":"append", "continue_on_error":false, "batch_rows":500
+    }))
+    .map_err(err)?;
+    let result = run_import(
+        conn,
+        table,
+        path,
+        &request,
+        &RunControl {
+            cancel,
+            progress,
+            max_rows: 5_000_000,
+        },
+    )
+    .await?;
+    Ok(result.inserted)
 }
 
 #[cfg(test)]

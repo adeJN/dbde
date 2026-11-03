@@ -82,7 +82,7 @@ Tekan Enter atau keluar dari textbox Rows per page untuk menerapkan angka. **Tab
 
 ## SQL dan transaksi
 
-Gunakan **New query** untuk menulis SQL. Tekan `⌘/Ctrl+Enter` untuk menjalankan SQL terpilih atau isi editor. Query history dan saved queries membantu memakai kembali query. Tombol **? / Help** menjelaskan shortcut berdasarkan konteks.
+Gunakan **New query** untuk menulis SQL. Tekan `⌘/Ctrl+Enter` untuk menjalankan query yang dicentang di gutter kiri, atau statement di kursor jika tidak ada centang. Query history dan saved queries membantu memakai kembali query. Tombol **? / Help** menjelaskan shortcut berdasarkan konteks.
 
 **Begin Transaction** menahan rangkaian perubahan sampai diputuskan untuk commit atau rollback sesuai alur yang tersedia. Selesaikan transaksi sebelum menutup koneksi atau memasang update. Perilaku DDL dan rollback berbeda antar engine; jangan mengasumsikan setiap perintah dapat dibatalkan.
 
@@ -98,7 +98,7 @@ Tekan `⌘/Ctrl+D` dari tabel aktif atau tabel terpilih untuk membuka **Design T
 
 Import/export menyediakan pilihan format, kolom, dan cakupan data sesuai dialog. Pilih cakupan secara eksplisit; hasil query, halaman aktif, dan seluruh tabel bisa mempunyai batas berbeda.
 
-Copy/paste tabel antardatabase bergantung pada engine dan konteks koneksi. Untuk server berbeda gunakan transfer/export/import yang sesuai. Perpindahan banyak tabel bukan satu transaksi global; jika gagal sebagian, periksa tabel yang sudah berhasil sebelum mengulang. Dump SQL bukan backup konsisten penuh ketika database masih menerima perubahan.
+Copy/paste tabel antardatabase bergantung pada engine dan konteks koneksi. Copy tabel lintas server tersedia untuk koneksi MySQL/MariaDB/TiDB yang kompatibel. Untuk perpindahan antar engine, gunakan Transfer Records atau export/import. Perpindahan banyak tabel bukan satu transaksi global; jika gagal sebagian, periksa tabel yang sudah berhasil sebelum mengulang. Dump SQL bukan backup konsisten penuh ketika database masih menerima perubahan.
 
 ## Batasan yang perlu diketahui
 
@@ -108,3 +108,35 @@ Copy/paste tabel antardatabase bergantung pada engine dan konteks koneksi. Untuk
 - Dukungan engine/versi server dan hak akses memengaruhi fitur yang tersedia.
 - MongoDB dan HTTP tunnel belum tersedia. Dukungan installer, SSH, dan integrasi live tetap perlu diuji pada OS/server yang dituju.
 - Updater membutuhkan GitHub Release yang benar. Panduan penerbitan ada di [RELEASING.md](RELEASING.md).
+
+## Proses panjang dan laporan
+
+Popup hasil menyediakan **Lihat log**. Berhasil menutup otomatis; kegagalan dan hasil dengan peringatan tetap tampil sampai ditutup. Import yang menolak sebagian record menampilkan jumlah inserted/updated/skipped/failed. Membatalkan proses berbeda dari kegagalan.
+
+Pada desktop, Transfer Records membaca satu snapshot per tabel ke file sementara privat lalu menulis batch dalam satu transaksi per tabel tujuan. Batasnya 5.000.000 record dan 512 MB per tabel; tujuan harus mendukung transaksi. Dump SQL menulis record langsung ke file, tanpa batas 100.000 record pada jalur desktop. Snapshot berlaku per tabel, bukan snapshot global seluruh database; DDL bersamaan tetap perlu dihentikan. MySQL memerlukan sumber InnoDB untuk pembacaan konsisten. Batas sandbox browser tetap berlaku.
+
+Copy/transfer/dump dapat dibatalkan dari **Process reports → Cancel operation**. Tabel yang selesai pada proses banyak tabel tetap dipertahankan. Jika koneksi terputus saat commit atau publish, refresh dan periksa tujuan sebelum mencoba ulang; perintah tulis tidak diputar ulang otomatis.
+
+Menutup aplikasi utama atau Quit memeriksa query belum disimpan, edit tertunda, transaksi dan operasi berjalan. Tutup jendela tabel terpisah terlebih dahulu agar perubahan di setiap jendela ikut diperiksa.
+
+## Cache pengembangan
+
+Untuk pengembang, hentikan proses Cargo/build yang berjalan lalu jalankan `npm run clean:cache`. Perintah ini menghapus cache kompilasi Rust pada target/debug dan target/release. Source, database, bundles aplikasi dan installer tetap dipertahankan. Build berikutnya mengompilasi dependency kembali. Ini tidak diperlukan pada perangkat pengguna installer.
+
+## SQL editor lanjutan
+
+Run query / ⌘ atau Ctrl+Enter menjalankan query yang dicentang di sisi kiri sesuai urutan script. Jika tidak ada centang, menjalankan teks terpilih atau statement di kursor. Pilihan centang dibersihkan saat SQL diedit. Menu **Select queries** menyediakan checkbox yang dapat diakses keyboard; query yang dimulai pada baris sama dapat dipilih terpisah melalui menu ini. **Run statement** / ⌘ atau Ctrl+Shift+Enter menjalankan seleksi atau statement di posisi kursor. **⌘ atau Ctrl+Alt+Enter** menjalankan seluruh script. Semua jalur memakai konfirmasi SQL destruktif yang sama. Untuk routine/trigger, DELIMITER, atau komentar MySQL yang dapat dieksekusi, pilih SQL secara eksplisit atau gunakan Run script; outline bukan parser server.
+
+Dropdown di bawah editor berpindah antar statement. Statement aktif ditandai lembut; status menampilkan posisi kursor dan jumlah karakter terpilih. Autocomplete mengenali alias tabel, misalnya `SELECT c.` dengan `FROM customers c`, serta mengutip identifier bila diperlukan. Alias CTE/subquery dan schema yang ambigu tidak ditebak.
+
+Menu **Editor settings** menyimpan ukuran font, indentasi 2/4 spasi, word wrap, minimap, dan nomor baris pada perangkat ini. Tersedia folding, multi-cursor, toggle komentar (⌘/Ctrl+/), dan Go to line (Ctrl+G). **Shift+Alt+F** atau tombol Format memformat seleksi/SQL; hasil dapat di-undo. Pemeriksaan tanda kutip, komentar, dan kurung hanya pemeriksaan dasar, bukan validasi sintaks, izin atau hasil SQL oleh server.
+
+### Menyalin tabel yang memiliki foreign key
+
+Untuk MySQL, MariaDB, dan TiDB di aplikasi desktop, pilih tabel anak beserta semua tabel induk yang dirujuk, lalu Copy dan Paste ke database tujuan. DBde memeriksa nama tujuan dan dependensi sebelum membuat salinan. Jika tabel induk belum dipilih, pesan error menyebutkan tabel yang perlu disertakan.
+
+Salinan disiapkan di tabel sementara milik operasi, jumlah record diperiksa, lalu foreign key dipasang dengan validasi aktif. Setelah semua relasi valid, tabel diterbitkan bersama. Relasi ke diri sendiri, relasi melingkar, pasangan kolom gabungan, serta aturan ON UPDATE/ON DELETE dipertahankan. Nama constraint foreign key dibuat unik; nama tabel tujuan yang diubah juga dipetakan pada relasinya.
+
+Tabel yang sudah ada tidak ditimpa. Nama yang sama mendapat saran nama salinan baru. Jika proses lama sudah menyalin beberapa tabel, pilih tabel yang belum disalin beserta dependensinya; DBde tidak menganggap tabel lama identik tanpa pemeriksaan. Jika terjadi kegagalan, staging dibersihkan sejauh koneksi memungkinkan dan laporan tetap tersedia. Setelah koneksi terputus saat publikasi, refresh dan periksa tujuan sebelum mencoba lagi.
+
+Progress grup menghitung tabel yang disiapkan, validasi relasi, dan publikasi. Angka tidak mencapai 100% hanya karena transfer record selesai. Snapshot data diambil per tabel; jika sumber sedang aktif berubah, pertimbangkan waktu pemindahan yang tenang. Trigger, hak akses, routine, dan fitur khusus server tidak termasuk dalam copas tabel ini.

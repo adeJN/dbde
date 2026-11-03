@@ -135,6 +135,7 @@ impl client::Handler for HostVerifier {
 // Detached windows share this owner; closing the original window cannot kill their tunnel.
 pub(crate) struct Tunnel {
     task: tokio::task::JoinHandle<()>,
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
     #[cfg(unix)]
     directory: PathBuf,
     #[cfg(unix)]
@@ -153,6 +154,12 @@ impl Drop for Tunnel {
     }
 }
 impl Tunnel {
+    pub fn connection_error(&self, error: impl std::fmt::Display) -> String {
+        match self.last_error.lock().ok().and_then(|value| value.clone()) {
+            Some(detail) => format!("{error}. SSH tunnel recovery failed: {detail}"),
+            None => error.to_string(),
+        }
+    }
     pub fn pg_options(
         &self,
         options: sqlx::postgres::PgConnectOptions,
@@ -179,6 +186,68 @@ impl Tunnel {
             options.host("127.0.0.1").port(self.port)
         }
     }
+}
+
+async fn authenticated_session(
+    ssh: &SshOptions,
+    secret: &str,
+) -> DbResult<client::Handle<HostVerifier>> {
+    let handler = HostVerifier {
+        host: ssh.host.trim().into(),
+        port: ssh.port.unwrap_or(22),
+        fingerprint: ssh.fingerprint.trim().into(),
+    };
+    let settings = client::Config {
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..Default::default()
+    };
+    let mut session = client::connect(
+        Arc::new(settings),
+        (ssh.host.trim(), ssh.port.unwrap_or(22)),
+        handler,
+    )
+    .await
+    .map_err(|error| error.message(secret))?;
+    let result = if ssh.auth == "private_key" {
+        let path = ssh.private_key.clone();
+        let passphrase = secret.to_owned();
+        let key = tokio::task::spawn_blocking(move || {
+            keys::load_secret_key(
+                path,
+                if passphrase.is_empty() {
+                    None
+                } else {
+                    Some(&passphrase)
+                },
+            )
+        })
+        .await
+        .map_err(|e| safe_error(e, secret))?
+        .map_err(|e| format!("Cannot load SSH private key: {}", safe_error(e, secret)))?;
+        let hash = session
+            .best_supported_rsa_hash()
+            .await
+            .map_err(|e| safe_error(e, secret))?
+            .flatten();
+        session
+            .authenticate_publickey(
+                &ssh.username,
+                PrivateKeyWithHashAlg::new(Arc::new(key), hash),
+            )
+            .await
+            .map_err(|e| safe_error(e, secret))?
+    } else {
+        session
+            .authenticate_password(&ssh.username, secret)
+            .await
+            .map_err(|e| safe_error(e, secret))?
+    };
+    if !result.success() {
+        return Err(
+            "SSH authentication failed. Check the SSH username and password/private key.".into(),
+        );
+    }
+    Ok(session)
 }
 
 pub(crate) async fn open(
@@ -211,62 +280,7 @@ pub(crate) async fn open(
         .map_err(err)??
     };
     let operation = async {
-        let handler = HostVerifier {
-            host: ssh.host.trim().into(),
-            port: ssh.port.unwrap_or(22),
-            fingerprint: ssh.fingerprint.trim().into(),
-        };
-        let settings = client::Config {
-            keepalive_interval: Some(Duration::from_secs(30)),
-            ..Default::default()
-        };
-        let mut session = client::connect(
-            Arc::new(settings),
-            (ssh.host.trim(), ssh.port.unwrap_or(22)),
-            handler,
-        )
-        .await
-        .map_err(|error| error.message(&secret))?;
-        let result = if ssh.auth == "private_key" {
-            let path = ssh.private_key.clone();
-            let passphrase = secret.clone();
-            let key = tokio::task::spawn_blocking(move || {
-                keys::load_secret_key(
-                    path,
-                    if passphrase.is_empty() {
-                        None
-                    } else {
-                        Some(&passphrase)
-                    },
-                )
-            })
-            .await
-            .map_err(|e| safe_error(e, &secret))?
-            .map_err(|e| format!("Cannot load SSH private key: {}", safe_error(e, &secret)))?;
-            let hash = session
-                .best_supported_rsa_hash()
-                .await
-                .map_err(|e| safe_error(e, &secret))?
-                .flatten();
-            session
-                .authenticate_publickey(
-                    &ssh.username,
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                )
-                .await
-                .map_err(|e| safe_error(e, &secret))?
-        } else {
-            session
-                .authenticate_password(&ssh.username, &secret)
-                .await
-                .map_err(|e| safe_error(e, &secret))?
-        };
-        if !result.success() {
-            return Err(
-                "SSH authentication failed. Check the SSH username and password/private key."
-                    .into(),
-            );
-        }
+        let session = authenticated_session(ssh, &secret).await?;
         // Confirm forwarding is allowed and destination is reachable before opening the DB pool.
         let probe = session
             .channel_open_direct_tcpip(&config.host, u32::from(config.port), "127.0.0.1", 0)
@@ -311,8 +325,12 @@ pub(crate) async fn open(
             .port();
         let host = config.host.clone();
         let port_target = config.port;
+        let reconnect_options = ssh.clone();
+        let reconnect_timeout = config.options.timeout();
+        let last_error = Arc::new(std::sync::Mutex::new(None));
+        let forwarding_error = last_error.clone();
         let task = tokio::spawn(async move {
-            let session = Arc::new(session);
+            let session = Arc::new(Mutex::new(session));
             let mut channels = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
@@ -320,9 +338,31 @@ pub(crate) async fn open(
                         let Ok((mut local, _)) = accepted else { break; };
                         let session = session.clone();
                         let host = host.clone();
+                        let ssh = reconnect_options.clone();
+                        let secret = secret.clone();
+                        let last_error = forwarding_error.clone();
                         channels.spawn(async move {
-                            let channel = tokio::time::timeout(Duration::from_secs(30), session.channel_open_direct_tcpip(host, u32::from(port_target), "127.0.0.1", 0)).await;
-                            if let Ok(Ok(channel)) = channel {
+                            // Reconnect only before forwarding a new DB connection.
+                            // Existing streams and already-sent SQL are never replayed.
+                            let channel = async {
+                                let mut session = session.lock().await;
+                                if !session.is_closed() {
+                                    if let Ok(Ok(channel)) = tokio::time::timeout(reconnect_timeout,
+                                        session.channel_open_direct_tcpip(host.clone(), u32::from(port_target), "127.0.0.1", 0)).await {
+                                        return Ok(channel);
+                                    }
+                                }
+                                *session = tokio::time::timeout(reconnect_timeout, authenticated_session(&ssh, &secret))
+                                    .await.map_err(|_| "SSH reconnection timed out".to_string())??;
+                                tokio::time::timeout(reconnect_timeout,
+                                    session.channel_open_direct_tcpip(host, u32::from(port_target), "127.0.0.1", 0))
+                                    .await.map_err(|_| "SSH forwarding timed out".to_string())?
+                                    .map_err(|e| safe_error(e, &secret))
+                            }.await;
+                            if let Ok(mut saved) = last_error.lock() {
+                                *saved = channel.as_ref().err().cloned();
+                            }
+                            if let Ok(channel) = channel {
                                 let mut remote = channel.into_stream();
                                 let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
                             }
@@ -334,6 +374,7 @@ pub(crate) async fn open(
         });
         Ok(Some(Arc::new(Tunnel {
             task,
+            last_error,
             #[cfg(unix)]
             directory,
             #[cfg(unix)]
@@ -424,6 +465,7 @@ mod tests {
     #[derive(Clone)]
     struct EchoServer {
         client_key: PublicKey,
+        handles: Arc<Mutex<Vec<russh::server::Handle>>>,
     }
     #[cfg(unix)]
     impl russh::server::Server for EchoServer {
@@ -464,11 +506,12 @@ mod tests {
             port: u32,
             _: &str,
             _: u32,
-            _: &mut russh::server::Session,
+            session: &mut russh::server::Session,
         ) -> Result<bool, Self::Error> {
             if host != "remote-db.internal" || port != 3306 {
                 return Ok(false);
             }
+            self.handles.lock().await.push(session.handle());
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut stream = channel.into_stream();
@@ -502,8 +545,10 @@ mod tests {
             .await
             .unwrap();
         let port = listener.local_addr().unwrap().port();
+        let handles = Arc::new(Mutex::new(Vec::new()));
         let mut server = EchoServer {
             client_key: client_key.public_key().clone(),
+            handles: handles.clone(),
         };
         let settings = Arc::new(russh::server::Config {
             keys: vec![host_key],
@@ -554,7 +599,30 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(response, message);
+            if message == b"first" {
+                // The server stays available, but drops the authenticated session.
+                // The next DB connection must use the same local tunnel socket.
+                let previous = std::mem::take(&mut *handles.lock().await);
+                for handle in previous {
+                    let _ = handle
+                        .disconnect(
+                            russh::Disconnect::ByApplication,
+                            "idle timeout".into(),
+                            "".into(),
+                        )
+                        .await;
+                }
+                let mut eof = [0];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), stream.read(&mut eof))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            }
         }
+        assert!(shared.last_error.lock().unwrap().is_none());
         drop(shared);
         assert!(!directory.exists());
         config.options.ssh.password = Some("incorrect".into());

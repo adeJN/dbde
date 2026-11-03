@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Copy, X, Loader2, ArrowUpRight } from "lucide-react";
 import * as api from "../lib/api";
+import { useProcessReports, processFailure } from "../lib/process-reports";
 import { mappedRecords, readTable } from "../lib/table-tools";
 import type { ColumnMapping, Session, TableInfo } from "../types";
 
@@ -42,6 +43,7 @@ export default function TableToolsDialog({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const root = useRef<HTMLElement>(null);
+  const operationId = useRef<string>();
   const copy = r.mode === "copy";
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -112,14 +114,24 @@ export default function TableToolsDialog({
     if (busy || loading) return;
     setBusy(true);
     setError("");
+    const reports = useProcessReports.getState();
+    const reportId = copy
+      ? undefined
+      : reports.start(
+          "Transfer records",
+          `${r.database} / ${r.table.name} → ${database}`,
+        );
+
     try {
       if (copy) {
+        operationId.current = crypto.randomUUID();
         await api.copyTable(
           r.session.id,
           r.database,
           r.table,
           { name: name.trim(), schema, kind: "table" },
           data,
+          operationId.current,
         );
         onDone(
           r.session.id,
@@ -138,21 +150,46 @@ export default function TableToolsDialog({
         )
           throw new Error("Source and target must be different tables.");
         if (!mapping.length) throw new Error("Map at least one column.");
-        const result = await readTable(
-          r.session.id,
-          r.database,
-          r.table,
-          r.session.config.driver,
-          5000,
-        );
-        const changes = mappedRecords(result, mapping);
-        const count = changes.length
-          ? await api.applyChanges(
-              connectionId,
-              { database, table: target, primary_keys: [] },
-              changes,
-            )
-          : 0;
+        let count: number;
+        operationId.current = crypto.randomUUID();
+        if (api.desktop)
+          count = await api.transferRecords(
+            r.session.id,
+            r.database,
+            r.table,
+            connectionId,
+            database,
+            target,
+            mapping,
+            operationId.current,
+          );
+        else {
+          const result = await readTable(
+            r.session.id,
+            r.database,
+            r.table,
+            r.session.config.driver,
+            5000,
+            (rows) => {
+              if (reportId) reports.progress(reportId, "Reading records", rows);
+            },
+          );
+          const changes = mappedRecords(result, mapping);
+          count = changes.length
+            ? await api.applyChanges(
+                connectionId,
+                { database, table: target, primary_keys: [] },
+                changes,
+              )
+            : 0;
+        }
+        operationId.current = undefined;
+        if (reportId)
+          reports.finish(
+            reportId,
+            "success",
+            `${count} records transferred to ${target.name}`,
+          );
         onDone(
           connectionId,
           database,
@@ -161,6 +198,8 @@ export default function TableToolsDialog({
         );
       }
     } catch (e) {
+      if (reportId) reports.finish(reportId, "error", processFailure(e));
+      operationId.current = undefined;
       setError(String(e));
       setBusy(false);
     }
@@ -327,10 +366,11 @@ export default function TableToolsDialog({
                 </div>
               )}
               <p className="table-tools-note">
-                Appends up to 5,000 saved scalar records in one transaction.
-                Existing rows stay. Duplicate keys or invalid values cancel the
-                entire transfer. Omit auto-generated IDs to use target defaults.
-                Pause other writes while transferring.
+                Appends up to 5,000,000 on desktop (5,000 in browser) saved
+                scalar records in one transaction. Existing rows stay. Duplicate
+                keys or invalid values cancel the entire transfer. Omit
+                auto-generated IDs to use target defaults. Pause other writes
+                while transferring.
               </p>
             </>
           )}
@@ -344,10 +384,16 @@ export default function TableToolsDialog({
         <footer>
           <button
             className="button secondary"
-            disabled={busy}
-            onClick={onClose}
+            disabled={busy && !operationId.current}
+            onClick={() =>
+              busy && operationId.current
+                ? void api
+                    .cancelOperation(operationId.current)
+                    .catch((e) => setError(String(e)))
+                : onClose()
+            }
           >
-            Cancel
+            {busy ? (copy ? "Cancel copy" : "Cancel transfer") : "Cancel"}
           </button>
           <button
             className="button primary"

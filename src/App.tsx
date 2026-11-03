@@ -1,11 +1,14 @@
+import { formatEditorSql } from "./lib/editor-format";
 import { version as appVersion } from "../package.json";
 import type { DatabaseToolPane } from "./components/databaseToolItems";
-import DatabaseTools from "./components/DatabaseTools";
+
 import AreaContextMenu, { type AreaMenu } from "./components/AreaContextMenu";
 import { textContextItems } from "./lib/text-context-menu";
 import HelpDialog from "./components/HelpDialog";
 import ThemeToggle from "./components/ThemeToggle";
 import AppUpdater from "./components/AppUpdater";
+import ProcessReports from "./components/ProcessReports";
+import { useProcessReports, processFailure } from "./lib/process-reports";
 import {
   editorSearchFromKey,
   editorSearchShortcut,
@@ -14,11 +17,11 @@ import {
 import PasteTablesDialog from "./components/PasteTablesDialog";
 import type { TableClipboard } from "./lib/table-clipboard";
 import { writeClipboard } from "./lib/clipboard";
-import { useAutoDismiss } from "./hooks/useAutoDismiss";
 import { createPortal } from "react-dom";
 import {
   lazy,
   Suspense,
+  type ComponentProps,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -41,9 +44,6 @@ import {
   RefreshCw,
   Unplug,
   CircleHelp,
-  CircleCheck,
-  CircleAlert,
-  Info,
   Terminal,
   Layers,
   ArrowUpRight,
@@ -157,9 +157,7 @@ import {
   type ConnectionAppearance,
 } from "./lib/connection-menu";
 import appIcon from "../app-icon.svg";
-import TableDesigner, {
-  type TableDesignerRequest,
-} from "./components/TableDesigner";
+import type { TableDesignerRequest } from "./components/TableDesigner";
 import TableStructure, {
   type TableStructureRequest,
 } from "./components/TableStructure";
@@ -176,9 +174,9 @@ import {
   type MaintainResult,
 } from "./lib/maintain";
 import RenameTableDialog from "./components/RenameTableDialog";
-import ExportDialog, { type ExportRequest } from "./components/ExportDialog";
+import type { ExportRequest } from "./components/ExportDialog";
 import { exportSummaryText } from "./lib/export";
-import ImportDialog from "./components/ImportDialog";
+
 import { importSummaryText, type ImportSummary } from "./lib/import";
 import TableToolsDialog, {
   type TableToolRequest,
@@ -203,7 +201,50 @@ import DatabaseDialog, {
 import DatabaseUtilityDialog, {
   type DatabaseUtilityRequest,
 } from "./components/DatabaseUtilityDialog";
-import { databaseFileName, dumpDatabase } from "./lib/database-tools";
+import {
+  databaseFileName,
+  dumpDatabase,
+  dumpDatabaseFile,
+} from "./lib/database-tools";
+const LazyDatabaseTools = lazy(() => import("./components/DatabaseTools"));
+const LazyTableDesigner = lazy(() => import("./components/TableDesigner"));
+const LazyExportDialog = lazy(() => import("./components/ExportDialog"));
+const LazyImportDialog = lazy(() => import("./components/ImportDialog"));
+const loadingDialog = (
+  <div className="modal-backdrop">
+    <div className="modal" role="status">
+      Loading…
+    </div>
+  </div>
+);
+function DatabaseTools(props: ComponentProps<typeof LazyDatabaseTools>) {
+  return (
+    <Suspense fallback={loadingDialog}>
+      <LazyDatabaseTools {...props} />
+    </Suspense>
+  );
+}
+function TableDesigner(props: ComponentProps<typeof LazyTableDesigner>) {
+  return (
+    <Suspense fallback={loadingDialog}>
+      <LazyTableDesigner {...props} />
+    </Suspense>
+  );
+}
+function ExportDialog(props: ComponentProps<typeof LazyExportDialog>) {
+  return (
+    <Suspense fallback={loadingDialog}>
+      <LazyExportDialog {...props} />
+    </Suspense>
+  );
+}
+function ImportDialog(props: ComponentProps<typeof LazyImportDialog>) {
+  return (
+    <Suspense fallback={loadingDialog}>
+      <LazyImportDialog {...props} />
+    </Suspense>
+  );
+}
 const QueryEditor = lazy(() => import("./components/QueryEditor"));
 type DatabaseAction =
   | "new-table"
@@ -1204,21 +1245,11 @@ export default function App() {
     }
   }
   const [search, setSearch] = useState("");
-  const [noticeState, updateNotice] = useState<{
-    text: string;
-    tone: "error" | "success" | "info";
-  }>({ text: "", tone: "info" });
-  const notice = noticeState.text;
-  const noticeDismiss = useAutoDismiss(
-    noticeState,
-    () => updateNotice({ text: "", tone: "info" }),
-    !!notice && noticeState.tone !== "error",
-  );
   function setNotice(
     text: string,
-    tone: "error" | "success" | "info" = "error",
+    tone: "error" | "success" | "warning" | "info" = "error",
   ) {
-    updateNotice({ text, tone });
+    useProcessReports.getState().notify(text, tone);
   }
   const [tableTool, setTableTool] = useState<TableToolRequest | null>(null);
   const [tableClipboard, setTableClipboard] = useState<TableClipboard | null>(
@@ -1295,6 +1326,8 @@ export default function App() {
     useState<TableDesignerRequest | null>(null);
   const [tableStructure, setTableStructure] =
     useState<TableStructureRequest | null>(null);
+  const designDialogOpen = useRef(false);
+  designDialogOpen.current = !!tableDesigner || !!tableStructure;
   const [renameRequest, setRenameRequest] = useState<{
     session: Session;
     database: string;
@@ -1398,22 +1431,65 @@ export default function App() {
       });
   }, [w.activeTab]);
   useEffect(() => {
-    if (!api.desktop || location.hash !== "#detached") return;
+    if (!api.desktop) return;
     let stopped = false;
     let cleanup: (() => void) | undefined;
-    void api
-      .guardDetachedWindowClose(async () => {
-        const tabs = useWorkspace.getState().tabs;
-        if (tabs.some((tab) => tab.running)) {
-          setNotice("Wait for running queries before closing this window.");
-          return false;
-        }
-        if (!(await confirmUnsavedQueries(tabs, "Closing the window")))
-          return false;
-        if (!(await confirmDiscardStaged(tabs, "Closing the window")))
-          return false;
-        return confirmRollback(tabs, "Closing the window");
-      })
+    const guard =
+      location.hash === "#detached"
+        ? api.guardDetachedWindowClose
+        : api.guardMainWindowClose;
+    if (!guard) return;
+    void guard(async () => {
+      const tabs = useWorkspace.getState().tabs;
+      if (designDialogOpen.current) {
+        setNotice(
+          "Close the table designer first and review any unsaved design changes before quitting.",
+        );
+        return false;
+      }
+      if (
+        tabs.some((tab) => tab.running) ||
+        useProcessReports.getState().reports.some((r) => r.status === "running")
+      ) {
+        setNotice(
+          "Wait for running operations to finish, or cancel them before closing this window.",
+        );
+        return false;
+      }
+      const drafts = tabs.filter(
+        (t) =>
+          t.kind !== "database" &&
+          !t.tableIdentity &&
+          !t.result?.source &&
+          !t.savedQueryId &&
+          t.query.trim() &&
+          t.query !== "-- Write a query, make a discovery.\nSELECT 1 AS hello;",
+      );
+      if (
+        drafts.length &&
+        !(await confirmAction({
+          title: "Close unsaved SQL queries?",
+          body: `The SQL in ${drafts.map((t) => t.name).join(", ")} is not saved. Save it before closing if you want to keep it.`,
+          confirmLabel: "Discard SQL and close",
+        }))
+      )
+        return false;
+      if (!(await confirmUnsavedQueries(tabs, "Closing the window")))
+        return false;
+      if (!(await confirmDiscardStaged(tabs, "Closing the window")))
+        return false;
+      if (!(await confirmRollback(tabs, "Closing the window"))) return false;
+      if (
+        useWorkspace.getState().tabs.some((t) => t.running) ||
+        useProcessReports.getState().reports.some((r) => r.status === "running")
+      ) {
+        setNotice(
+          "An operation started while confirming. Finish or cancel it before closing.",
+        );
+        return false;
+      }
+      return true;
+    })
       .then((unlisten) => {
         if (stopped) unlisten();
         else cleanup = unlisten;
@@ -1441,16 +1517,31 @@ export default function App() {
     api.desktop &&
     driverOf(t.connectionId) !== "sqlite";
   async function confirmRollback(tabs: QueryTab[], action: string) {
-    const open = (
-      await Promise.all(
-        tabs.filter(ownsSession).map((t) =>
-          api
-            .sessionInTransaction(t.connectionId, t.id)
-            .catch(() => false)
-            .then((inTransaction) => (inTransaction ? t : undefined)),
-        ),
-      )
-    ).filter((t): t is QueryTab => !!t);
+    const checked = await Promise.all(
+      tabs.filter(ownsSession).map((t) =>
+        api
+          .sessionInTransaction(t.connectionId, t.id)
+          .catch(() => null)
+          .then((inTransaction) => ({ tab: t, inTransaction })),
+      ),
+    );
+    const unknown = checked.filter((item) => item.inTransaction == null);
+    const open = checked
+      .filter((item) => item.inTransaction === true)
+      .map((item) => item.tab);
+    if (unknown.length) {
+      return confirmAction({
+        title: "Transaction status could not be verified",
+        body: `${action} may roll back uncommitted work. Cancel and check or commit these sessions first to keep your changes.`,
+        confirmLabel: "Close and discard pending transactions",
+        details: [
+          ...open.map((t) => `${t.name}: open transaction`),
+          ...unknown.map(
+            ({ tab }) => `${tab.name}: transaction status unknown`,
+          ),
+        ],
+      });
+    }
     if (!open.length) return true;
     return confirmAction({
       title: "Roll back the open transaction?",
@@ -2086,7 +2177,9 @@ export default function App() {
         id,
         current?.timeoutSecs,
       );
-      useWorkspace.getState().updateTab(id, { result });
+      useWorkspace
+        .getState()
+        .updateTab(id, { result, lastExecutedQuery: query });
       outcome = { result };
       // Edit/New object scripts run here; reload object lists they may have changed.
       if (/\b(CREATE|ALTER|DROP|REFRESH)\b/i.test(query)) {
@@ -2128,6 +2221,22 @@ export default function App() {
   }
   async function run(selection?: string) {
     if (!tab || tab.running || tab.kind === "database") return;
+    if (detached && selection === undefined) {
+      if (!tab.lastExecutedQuery?.trim()) {
+        setNotice(
+          "The original executed SQL is unavailable. Return to the main window and select the query to run.",
+        );
+        return;
+      }
+      selection = tab.lastExecutedQuery;
+    }
+    if (selection === undefined) {
+      const action = editor.current?.getAction("dbde-run-query");
+      if (action) {
+        void action.run();
+        return;
+      }
+    }
     const selected =
       selection ??
       (editor.current?.getSelection()
@@ -2330,6 +2439,126 @@ export default function App() {
       tableActionBusy.current = false;
     }
   }
+  async function deleteTables(
+    session: Session,
+    database: string,
+    requested: TableInfo[],
+  ) {
+    const tables = Array.from(
+      new Map(
+        requested.map((t) => [JSON.stringify([t.schema, t.name]), t]),
+      ).values(),
+    );
+    if (tables.length === 1)
+      return tableAction(session, database, tables[0], "drop");
+    if (!tables.length || tableActionBusy.current) return;
+    if (tables.length > 100) {
+      setNotice("Delete up to 100 tables at a time.");
+      return;
+    }
+    const targetName = (table: TableInfo) =>
+      [
+        database,
+        table.schema !== database ? table.schema : undefined,
+        table.name,
+      ]
+        .filter(Boolean)
+        .join(".");
+    tableActionBusy.current = true;
+    const reports = useProcessReports.getState();
+    let reportId: string | undefined;
+    let completed = 0;
+    try {
+      const related = databaseTabs(session, database);
+      if (related.some((t) => t.running))
+        throw new Error("Wait for running queries in this database to finish.");
+      const matches = (table?: TableInfo) =>
+        table &&
+        tables.some((t) => t.schema === table.schema && t.name === table.name);
+      const affected = related.filter(
+        (t) =>
+          matches(t.result?.source?.table) ||
+          (t.tableIdentity &&
+            tables.some(
+              (table) =>
+                table.schema === t.tableIdentity?.schema &&
+                table.name === t.tableIdentity?.name,
+            )),
+      );
+      let foreignKeyChecks: ForeignKeyChecks = "default";
+      if (
+        !(await confirmAction({
+          title: `Delete ${tables.length} selected tables/views?`,
+          body: "Permanently deletes the listed objects and their records. Tables are deleted one at a time. If one fails, deletion stops; completed deletions cannot be rolled back. Review dependencies before continuing.",
+          confirmLabel: `Delete ${tables.length} objects`,
+          tableDeletion: {
+            targets: tables.map(targetName),
+            allowForeignKeyChecks:
+              session.config.driver === "mysql" &&
+              tables.every((t) => t.kind === "table"),
+            onForeignKeyChecks: (mode) => {
+              foreignKeyChecks = mode;
+            },
+          },
+        }))
+      )
+        return;
+      if (!(await confirmDiscardStaged(affected, "Deleting selected tables")))
+        return;
+      if (!(await confirmRollback(related, "Deleting selected tables"))) return;
+      reportId = reports.start(
+        "Delete tables",
+        `${session.config.name} / ${database} · ${tables.length} objects`,
+      );
+      reports.progress(reportId, "Closing query sessions before deletion");
+      for (const tab of related.filter(ownsSession))
+        await api.closeSession(tab.connectionId, tab.id);
+      for (const table of tables) {
+        reports.progress(
+          reportId,
+          `Deleting ${targetName(table)} (${completed}/${tables.length} completed)`,
+        );
+        try {
+          await api.dropTable(session.id, database, table, foreignKeyChecks);
+        } catch (cause) {
+          reports.progress(
+            reportId,
+            `Failed or unconfirmed: ${targetName(table)}. ${processFailure(cause)}`,
+          );
+          for (const skipped of tables.slice(completed + 1))
+            reports.progress(reportId, `Not attempted: ${targetName(skipped)}`);
+          throw cause;
+        }
+        completed++;
+        reports.progress(
+          reportId,
+          `Deleted ${targetName(table)} (${completed}/${tables.length})`,
+        );
+        for (const tab of affected) {
+          const source = tab.result?.source?.table ?? tab.tableIdentity;
+          if (source?.schema === table.schema && source?.name === table.name)
+            w.closeTab(tab.id);
+        }
+      }
+      reports.finish(
+        reportId,
+        "success",
+        `${completed}/${tables.length} objects deleted`,
+      );
+      setNotice(`Deleted ${completed} tables/views.`, "success");
+    } catch (cause) {
+      if (reportId)
+        reports.finish(
+          reportId,
+          "error",
+          `Stopped: ${completed}/${tables.length} deletions confirmed. Completed deletions are permanent. Refresh before retrying.`,
+        );
+      setNotice(String(cause));
+    } finally {
+      if (reportId) invalidateDatabase(session.id, database);
+      tableActionBusy.current = false;
+    }
+  }
   async function tableAction(
     s: Session,
     database: string,
@@ -2408,6 +2637,22 @@ export default function App() {
       }
       if (action === "export" || action === "dump") {
         setNotice(`Preparing SQL dump for ${table.name}…`, "info");
+        if (api.desktop && action === "dump") {
+          const ddl = await api.tableDdl(s.id, table, database);
+          const saved = await api.dumpSqlFile(
+            s.id,
+            database,
+            [table],
+            ddl,
+            "",
+            true,
+          );
+          setNotice(
+            saved ? `SQL saved to ${saved}` : "SQL export cancelled.",
+            saved ? "success" : "info",
+          );
+          return;
+        }
         const ddl = await dumpTable(
           s.id,
           database,
@@ -2644,7 +2889,10 @@ export default function App() {
   ) {
     const { session: s, database, table } = request;
     invalidateDatabase(s.id, database);
-    setNotice(`${table.name}: ${importSummaryText(summary)}`, "success");
+    setNotice(
+      `${table.name}: ${importSummaryText(summary)}`,
+      summary.failed > 0 ? "warning" : "success",
+    );
     for (const t of importTabs(request).affected) {
       w.updateTab(t.id, { staged: undefined });
       const source = t.result?.source;
@@ -3118,16 +3366,25 @@ export default function App() {
       }
       if (action === "dump-structure" || action === "dump-data") {
         setNotice(`Preparing SQL dump for ${database}…`, "info");
-        const contents = await dumpDatabase(
-          session,
-          database,
-          action === "dump-data",
-        );
-        const saved = await api.saveFile(
-          databaseFileName(database, "sql"),
-          "sql",
-          contents,
-        );
+        let saved: string | null;
+        if (api.desktop)
+          saved = await dumpDatabaseFile(
+            session,
+            database,
+            action === "dump-data",
+          );
+        else {
+          const contents = await dumpDatabase(
+            session,
+            database,
+            action === "dump-data",
+          );
+          saved = await api.saveFile(
+            databaseFileName(database, "sql"),
+            "sql",
+            contents,
+          );
+        }
         setNotice(
           saved ? `SQL saved to ${saved}` : "SQL export cancelled.",
           saved ? "success" : "info",
@@ -3474,11 +3731,30 @@ export default function App() {
     }
   }
   async function removeSaved(config: ConnectionConfig) {
+    if (connectionActionsPending.current.has(config.id)) return;
+    connectionActionsPending.current.add(config.id);
     try {
+      if (
+        !(await confirmAction({
+          title: "Delete saved connection?",
+          body: (
+            <>
+              Remove <strong>{config.name}</strong> from saved connections on
+              this device? Its saved credentials will also be removed.
+              Databases, tables and records on the server are kept.
+            </>
+          ),
+          confirmLabel: "Delete Connection",
+        }))
+      )
+        return;
       await api.deleteProfile(config.id);
       setProfiles(await api.listProfiles());
+      setNotice(`Saved connection ${config.name} deleted.`, "success");
     } catch (e) {
       setNotice(String(e));
+    } finally {
+      connectionActionsPending.current.delete(config.id);
     }
   }
   async function runTableView(
@@ -3839,6 +4115,7 @@ export default function App() {
           <div className="titlebar-actions">
             <ThemeToggle />
             <AppUpdater />
+            {!detached && <ProcessReports />}
             <button
               className="icon-button"
               aria-label="Help and shortcuts"
@@ -4314,41 +4591,6 @@ export default function App() {
               </button>
             </div>
           )}
-          {notice && (
-            <div
-              {...noticeDismiss}
-              className={`notice ${noticeState.tone}`}
-              role={noticeState.tone === "error" ? "alert" : "status"}
-            >
-              {noticeState.tone === "success" ? (
-                <CircleCheck
-                  className="notice-icon"
-                  size={16}
-                  aria-hidden="true"
-                />
-              ) : noticeState.tone === "error" ? (
-                <CircleAlert
-                  className="notice-icon"
-                  size={16}
-                  aria-hidden="true"
-                />
-              ) : (
-                <Info className="notice-icon" size={16} aria-hidden="true" />
-              )}
-              <span className="notice-text">{notice}</span>
-              <button
-                className="icon-button"
-                onClick={() => setNotice("")}
-                aria-label={
-                  noticeState.tone === "error"
-                    ? "Dismiss error"
-                    : "Dismiss notification"
-                }
-              >
-                <X size={14} />
-              </button>
-            </div>
-          )}
           {tab ? (
             <>
               {!detached && (
@@ -4536,6 +4778,9 @@ export default function App() {
                   onAction={(table, action) =>
                     void tableAction(session, tab.database!, table, action)
                   }
+                  onDelete={(tables) =>
+                    void deleteTables(session, tab.database!, tables)
+                  }
                   onMaintain={(tables, operation) =>
                     void maintainTables(
                       session,
@@ -4588,6 +4833,7 @@ export default function App() {
                     }}
                   >
                     {detached && <ThemeToggle />}
+                    {detached && <ProcessReports />}
                     {detached && (
                       <span
                         className="detached-table-context"
@@ -4611,27 +4857,29 @@ export default function App() {
                         </span>
                         <span className="editor-connection">
                           <span className="dot" />
-                          <select
-                            aria-label="Query database"
-                            value={tab.database ?? ""}
-                            disabled={
-                              detached ||
-                              tab.running ||
-                              !session?.databases?.length
-                            }
-                            onChange={(e) =>
-                              void changeDatabase(tab, e.target.value)
-                            }
-                          >
-                            {!tab.database && (
-                              <option value="">Choose database</option>
-                            )}
-                            {session?.databases?.map((database) => (
-                              <option key={database} value={database}>
-                                {database}
-                              </option>
-                            ))}
-                          </select>
+                          {!tab.result?.source && !tab.tableIdentity && (
+                            <select
+                              aria-label="Query database"
+                              value={tab.database ?? ""}
+                              disabled={
+                                detached ||
+                                tab.running ||
+                                !session?.databases?.length
+                              }
+                              onChange={(e) =>
+                                void changeDatabase(tab, e.target.value)
+                              }
+                            >
+                              {!tab.database && (
+                                <option value="">Choose database</option>
+                              )}
+                              {session?.databases?.map((database) => (
+                                <option key={database} value={database}>
+                                  {database}
+                                </option>
+                              ))}
+                            </select>
+                          )}
                         </span>
                       </>
                     )}
@@ -4796,18 +5044,10 @@ export default function App() {
                             title="Format SQL"
                             onClick={async () => {
                               try {
-                                const { format } =
-                                  await import("sql-formatter");
-                                w.updateTab(tab.id, {
-                                  query: format(tab.query, {
-                                    language:
-                                      session?.config.driver === "postgres"
-                                        ? "postgresql"
-                                        : session?.config.driver === "mysql"
-                                          ? "mysql"
-                                          : "sqlite",
-                                  }),
-                                });
+                                await formatEditorSql(
+                                  editor.current,
+                                  session?.config.driver ?? "sqlite",
+                                );
                               } catch (e) {
                                 setNotice(String(e));
                               }
@@ -4929,6 +5169,8 @@ export default function App() {
                           onChange={(query) => w.updateTab(tab.id, { query })}
                           onRun={(selection) => void run(selection)}
                           onExplain={() => void explainQuery()}
+                          running={tab.running}
+                          onError={(message) => setNotice(message)}
                           tables={
                             session?.trees?.[tab.database ?? ""]?.tables ?? []
                           }

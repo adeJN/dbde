@@ -55,6 +55,7 @@ const api = vi.hoisted(() => ({
   deleteProfile: vi.fn(),
   moveTabToWindow: vi.fn(),
   closeDetachedWindow: vi.fn(),
+  guardMainWindowClose: vi.fn().mockResolvedValue(() => {}),
   guardDetachedWindowClose: vi.fn(),
   listHistory: vi.fn(),
   appendHistory: vi.fn(),
@@ -150,6 +151,7 @@ beforeEach(() => {
     removeItem: (key: string) => storage.delete(key),
   });
   for (const fn of Object.values(api)) fn.mockReset();
+  api.guardMainWindowClose.mockResolvedValue(() => {});
   api.execute.mockResolvedValue({
     columns: [],
     rows: [],

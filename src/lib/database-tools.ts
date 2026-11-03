@@ -1,7 +1,8 @@
+import { useProcessReports, processFailure } from "./process-reports";
 import * as api from "./api";
 import { dumpTable } from "./table-tools";
 import { quoteIdentifier } from "./sql";
-import type { ConnectionConfig, Session } from "../types";
+import type { ConnectionConfig, Session, TableInfo } from "../types";
 export function sharedDatabaseProfile(
   config: ConnectionConfig,
   database: string,
@@ -28,12 +29,19 @@ export function sharedDatabaseProfile(
 }
 export const databaseFileName = (name: string, extension: string) =>
   `${name.replace(/[\\/\u0000-\u001f]/g, "_").slice(0, 180)}.${extension}`;
-export async function dumpDatabase(
+async function buildDatabaseDump(
   session: Session,
   database: string,
   data: boolean,
+  progress: (stage: string) => void,
+  stream?: (
+    before: string,
+    after: string,
+    tables: TableInfo[],
+  ) => Promise<string | null>,
 ): Promise<string> {
   const { driver } = session.config;
+  progress("Reading database objects");
   const tree = await api.schema(session.id, database);
   if (tree.tables.length > 200)
     throw new Error(
@@ -75,10 +83,19 @@ export async function dumpDatabase(
     for (const view of views)
       after.push(await api.tableDdl(session.id, view, database));
   }
-  if (data)
+  if (data && !stream)
     for (const table of tree.tables.filter((t) => t.kind === "table")) {
+      progress(`Exporting ${table.name}`);
       parts.push(
-        await dumpTable(session.id, database, table, driver, true, false),
+        await dumpTable(
+          session.id,
+          database,
+          table,
+          driver,
+          true,
+          false,
+          false,
+        ),
       );
       if (new Blob(parts).size > 512 * 1024 * 1024)
         throw new Error("The dump exceeds 512 MB.");
@@ -98,11 +115,70 @@ export async function dumpDatabase(
       if (selected.has(JSON.stringify([schema, name])))
         after.unshift(String(sql));
   }
-  parts.push(...after);
   if (driver === "mysql")
-    parts.push("SET FOREIGN_KEY_CHECKS = @DBDE_PREVIOUS_FK_CHECKS;");
-  if (driver === "sqlite") parts.push("PRAGMA foreign_keys = ON;");
+    after.push("SET FOREIGN_KEY_CHECKS = @DBDE_PREVIOUS_FK_CHECKS;");
+  if (driver === "sqlite") after.push("PRAGMA foreign_keys = ON;");
+  if (stream)
+    return (
+      (await stream(
+        parts.join("\n\n"),
+        after.join("\n\n"),
+        tree.tables.filter((t) => t.kind === "table"),
+      )) ?? ""
+    );
+  parts.push(...after);
   if (new Blob(parts).size > 512 * 1024 * 1024)
     throw new Error("The dump exceeds 512 MB.");
   return parts.join("\n\n") + "\n";
+}
+
+export async function dumpDatabase(
+  session: Session,
+  database: string,
+  data: boolean,
+): Promise<string> {
+  const reports = useProcessReports.getState();
+  const id = reports.start("SQL dump", database);
+  try {
+    const result = await buildDatabaseDump(session, database, data, (stage) =>
+      reports.progress(id, stage),
+    );
+    reports.finish(
+      id,
+      "success",
+      "SQL dump prepared; choose where to save the file",
+    );
+    return result;
+  } catch (cause) {
+    reports.finish(id, "error", processFailure(cause));
+    throw cause;
+  }
+}
+
+export async function dumpDatabaseFile(
+  session: Session,
+  database: string,
+  data: boolean,
+): Promise<string | null> {
+  const reports = useProcessReports.getState();
+  const id = reports.start("SQL dump plan", database);
+  try {
+    const saved = await buildDatabaseDump(
+      session,
+      database,
+      data,
+      (stage) => reports.progress(id, stage),
+      (prefix, suffix, tables) =>
+        api.dumpSqlFile(session.id, database, tables, prefix, suffix, data),
+    );
+    reports.finish(
+      id,
+      saved ? "success" : "cancelled",
+      saved ? "SQL dump saved" : "SQL dump cancelled",
+    );
+    return saved || null;
+  } catch (cause) {
+    reports.finish(id, "error", processFailure(cause));
+    throw cause;
+  }
 }

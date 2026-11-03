@@ -1,0 +1,153 @@
+.paste-progress {
+  margin: 16px 0 4px;
+  padding: 14px;
+  border: 1px solid var(--theme-border);
+  border-radius: 8px;
+  background: var(--theme-surface-panel);
+  color: var(--theme-text);
+}
+.paste-progress-heading,
+.paste-progress-summary,
+.paste-progress-tables li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.paste-progress-heading {
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+.paste-progress-heading > span {
+  color: var(--theme-accent-text);
+  font-variant-numeric: tabular-nums;
+}
+.paste-progress progress {
+  display: block;
+  width: 100%;
+  height: 7px;
+  border: none;
+  border-radius: 10px;
+  overflow: hidden;
+  appearance: none;
+  background: var(--theme-border);
+  accent-color: var(--theme-accent-text);
+}
+.paste-progress progress::-webkit-progress-bar {
+  background: var(--theme-border);
+}
+.paste-progress progress::-webkit-progress-value {
+  background: var(--theme-accent-text);
+  transition: width 180ms ease;
+  border-radius: 10px;
+}
+.paste-progress progress::-moz-progress-bar {
+  background: var(--theme-accent-text);
+  border-radius: 10px;
+}
+.paste-progress-summary {
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--theme-text-muted);
+  flex-wrap: wrap;
+}
+.paste-progress-summary button {
+  background: transparent;
+  color: var(--theme-accent-text);
+  border: 0;
+  padding: 3px;
+  font: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.paste-progress-summary button:hover {
+  background: var(--theme-accent-wash);
+}
+.paste-progress-summary button:focus-visible {
+  outline: 2px solid var(--theme-accent-text);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+.paste-current-table {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+  color: var(--theme-accent-text);
+  font-size: 12px;
+}
+.paste-current-table > div {
+  min-width: 0;
+}
+.paste-current-table strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.paste-current-table small {
+  display: block;
+  margin-top: 4px;
+  color: var(--theme-text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.paste-current-table > svg {
+  flex-shrink: 0;
+}
+.paste-progress-tables {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  max-height: 140px;
+  overflow: auto;
+}
+.paste-progress-tables li {
+  justify-content: flex-start;
+  padding: 6px 0;
+  font-size: 11px;
+}
+.paste-progress-tables li > span:not(.paste-status-dot) {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.paste-progress-tables li > svg {
+  flex-shrink: 0;
+}
+.paste-progress-tables small {
+  color: var(--theme-text-muted);
+  flex-shrink: 0;
+  font-size: 10px;
+}
+.paste-status-success {
+  color: var(--success-text);
+}
+.paste-status-dot {
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--theme-text-muted);
+  border-radius: 50%;
+  margin: 0 3px;
+  flex-shrink: 0;
+}
+.paste-progress .paste-progress-hint {
+  display: block;
+  color: var(--theme-text-muted);
+  font-size: 10px;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+.paste-progress.has-error {
+  border-color: var(--theme-danger-border);
+}
+@media (prefers-reduced-motion: reduce) {
+  .paste-progress progress::-webkit-progress-value {
+    transition: none;
+  }
+  .paste-current-table .spin,
+  .paste-progress-tables .spin {
+    animation: none;
+  }
+}

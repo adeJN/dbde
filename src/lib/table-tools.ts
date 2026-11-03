@@ -1,4 +1,5 @@
 import * as api from "./api";
+import { useProcessReports, processFailure } from "./process-reports";
 import { qualifiedName, quoteIdentifier } from "./sql";
 import { sqlLiteral, insertStatements } from "./grid";
 import type { ColumnMapping, Driver, QueryResult, TableInfo } from "../types";
@@ -10,7 +11,16 @@ export async function readTable(
   table: TableInfo,
   driver: Driver,
   limit: number,
+  onProgress?: (rows: number) => void,
 ): Promise<QueryResult> {
+  if (api.desktop)
+    return api.readTableSnapshot(
+      connectionId,
+      database,
+      table,
+      limit,
+      onProgress,
+    );
   const target = qualifiedName(table, driver);
   const count = await api.execute(
     connectionId,
@@ -55,6 +65,7 @@ export async function readTable(
         ),
       ),
     );
+    onProgress?.(rows.length);
     if (rows.length > limit)
       throw new Error(
         "The table grew beyond the operation limit. Nothing was transferred.",
@@ -98,7 +109,7 @@ export function mappedRecords(result: QueryResult, mapping: ColumnMapping[]) {
     ),
   }));
 }
-export async function dumpTable(
+async function buildTableDump(
   connectionId: string,
   database: string,
   table: TableInfo,
@@ -143,4 +154,48 @@ export async function dumpTable(
   if (new Blob([contents]).size > 512 * 1024 * 1024)
     throw new Error("The dump exceeds 512 MB.");
   return contents + "\n";
+}
+export async function dumpTable(
+  connectionId: string,
+  database: string,
+  table: TableInfo,
+  driver: Driver,
+  data: boolean,
+  includeDdl = true,
+  report = true,
+): Promise<string> {
+  if (!report)
+    return buildTableDump(
+      connectionId,
+      database,
+      table,
+      driver,
+      data,
+      includeDdl,
+    );
+  const reports = useProcessReports.getState();
+  const id = reports.start("SQL table dump", `${database} / ${table.name}`);
+  reports.progress(
+    id,
+    data ? "Reading structure and all records" : "Reading table structure",
+  );
+  try {
+    const contents = await buildTableDump(
+      connectionId,
+      database,
+      table,
+      driver,
+      data,
+      includeDdl,
+    );
+    reports.finish(
+      id,
+      "success",
+      "SQL dump prepared; choose where to save the file",
+    );
+    return contents;
+  } catch (cause) {
+    reports.finish(id, "error", processFailure(cause));
+    throw cause;
+  }
 }

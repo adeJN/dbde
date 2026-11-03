@@ -176,6 +176,9 @@ pub(crate) async fn dbde_install_update(
     update
         .install(bytes)
         .map_err(|e| format!("Unable to install the update: {e}"))?;
+    app.state::<lifecycle::Lifecycle>()
+        .0
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     app.restart();
 }
 

@@ -423,7 +423,7 @@ impl<W: Write> TextExport<W> {
             target,
             names,
             pending,
-            ..
+            driver,
         } = &mut self.body
         else {
             return Ok(());
@@ -431,11 +431,19 @@ impl<W: Write> TextExport<W> {
         if pending.is_empty() {
             return Ok(());
         }
+        let identity = if matches!(driver, Driver::Postgres) {
+            " OVERRIDING SYSTEM VALUE"
+        } else {
+            ""
+        };
         let statement = if pending.len() == 1 {
-            format!("INSERT INTO {target} ({names}) VALUES {};\n", pending[0])
+            format!(
+                "INSERT INTO {target} ({names}){identity} VALUES {};\n",
+                pending[0]
+            )
         } else {
             format!(
-                "INSERT INTO {target} ({names}) VALUES\n  {};\n",
+                "INSERT INTO {target} ({names}){identity} VALUES\n  {};\n",
                 pending.join(",\n  ")
             )
         };
@@ -710,20 +718,41 @@ async fn feed(
         .join(", ");
     let sql = format!("SELECT {projection} FROM {target}{where_sql}{order}");
     match &conn.pool {
-        Pool::Pg(p) => drain(sqlx::raw_sql(&sql).fetch(p), pg_cell, out, control).await,
+        Pool::Pg(p) => {
+            let mut tx = p.begin().await.map_err(err)?;
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *tx)
+                .await
+                .map_err(err)?;
+            let result = drain(sqlx::raw_sql(&sql).fetch(&mut *tx), pg_cell, out, control).await;
+            let _ = tx.rollback().await;
+            result
+        }
         Pool::My(p) => {
+            let mut socket = p.acquire().await.map_err(err)?;
+            socket.close_on_drop();
+            sqlx::query("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *socket)
+                .await
+                .map_err(err)?;
+            let mut tx = socket.begin().await.map_err(err)?;
             let mut statement = sqlx::query(&sql);
             for value in &values {
                 statement = statement.bind(value);
             }
-            drain(statement.fetch(p), my_cell, out, control).await
+            let result = drain(statement.fetch(&mut *tx), my_cell, out, control).await;
+            let _ = tx.rollback().await;
+            result
         }
         Pool::Lite(p) => {
+            let mut tx = p.begin().await.map_err(err)?;
             let mut statement = sqlx::query(&sql);
             for value in &values {
                 statement = statement.bind(value);
             }
-            drain(statement.fetch(p), lite_cell, out, control).await
+            let result = drain(statement.fetch(&mut *tx), lite_cell, out, control).await;
+            let _ = tx.rollback().await;
+            result
         }
     }
 }
@@ -1250,7 +1279,7 @@ mod tests {
         o.batch_size = 1;
         let pg = text_export(&o, &rows, Some(target(Driver::Postgres)));
         assert!(
-            pg.contains("INSERT INTO \"t`x\" (\"id\", \"note\") VALUES (1, 'it''s \\ fine');\n")
+            pg.contains("INSERT INTO \"t`x\" (\"id\", \"note\") OVERRIDING SYSTEM VALUE VALUES (1, 'it''s \\ fine');\n")
         );
         assert!(pg.contains("VALUES (3, '\\xbeef'::bytea);"));
         // Only real hex is treated as binary; anything else stays a quoted string.
@@ -1788,5 +1817,121 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+}
+
+// Internal streaming bridge: one SELECT per table, never OFFSET pagination.
+pub(crate) async fn snapshot_file(
+    conn: &Connection,
+    table: &TableInfo,
+    columns: &[String],
+    path: &Path,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(u64) + Send + Sync),
+) -> DbResult<u64> {
+    let options: ExportOptions = serde_json::from_value(
+        json!({"format":"json","columns":columns,"header":true,"protect_formulas":false}),
+    )
+    .map_err(err)?;
+    let plan = options.plan()?;
+    let all = rows::columns_of(conn, &qualified(table, &conn.config.driver)).await?;
+    check_columns(columns, &all)?;
+    let control = Control {
+        cancel,
+        progress,
+        stall: stall_limit(conn),
+    };
+    let result = export_to(
+        path,
+        &plan,
+        columns,
+        None,
+        Source::Table {
+            conn,
+            table,
+            filters: &[],
+            sort: None,
+        },
+        &control,
+    )
+    .await?;
+    Ok(result.rows)
+}
+
+/// Streams a reviewed database/table SQL plan to a native chosen file. Only the
+/// small DDL plan crosses IPC; records stay in bounded backend batches.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dbde_dump_sql(
+    connection_id: String,
+    database: String,
+    tables: Vec<TableInfo>,
+    prefix: String,
+    suffix: String,
+    data: bool,
+    operation_id: String,
+    on_progress: Channel<cross_copy::CopyProgress>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    operations: State<'_, operations::Operations>,
+) -> DbResult<Option<String>> {
+    if tables.len() > 200 || prefix.len() + suffix.len() > 8 * 1024 * 1024 {
+        return Err("SQL plan exceeds the metadata limit.".into());
+    }
+    let running = operations.start(operation_id)?;
+    let conn = database_connection(&state, &connection_id, Some(&database)).await?;
+    let Some(path) = pick_path(
+        app,
+        default_file_name(&database, ExportFormat::Sql),
+        ExportFormat::Sql,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let partial = partial_path(&path);
+    let work = bulk::TempWorkspace::new()?;
+    let result = operations::controlled(&running.flag, conn.config.options.query_timeout_secs.unwrap_or(300).max(300), async {
+        let mut output = BufWriter::new(File::create(&partial).map_err(err)?);
+        writeln!(output, "{prefix}").map_err(err)?;
+        let mut total = 0;
+        if data {
+            for table in &tables {
+                bulk::check_source(&conn, table).await?;
+                let columns = table_actions::writable_columns(&conn, table).await?;
+                let options: ExportOptions = serde_json::from_value(json!({"format":"sql","columns":columns,"batch_size":100})).map_err(err)?;
+                let plan = options.plan()?;
+                let progress = |rows| cross_copy::report(Some(&on_progress), &format!("Exporting {}", table.name), Some(total + rows));
+                let control = Control { cancel:&running.flag, progress:&progress, stall:stall_limit(&conn) };
+                let target = qualified(table, &conn.config.driver);
+                let file = work.0.join("table.sql");
+                let summary = export_to(&file, &plan, &columns, Some(SqlTarget { target:target.clone(), driver:conn.config.driver.clone(), ddl:None }), Source::Table {conn:&conn,table,filters:&[],sort:None}, &control).await?;
+                total += summary.rows;
+                let mut reader = File::open(&file).map_err(err)?;
+                std::io::copy(&mut reader, &mut output).map_err(err)?;
+                writeln!(output).map_err(err)?;
+                if matches!(conn.config.driver, Driver::Postgres) {
+                    let literal = sql_literal(&Value::String(target), &Driver::Postgres);
+                    let body = format!("DECLARE c record; v bigint; BEGIN FOR c IN SELECT a.attname AS name, pg_get_serial_sequence({literal}, a.attname) AS seq FROM pg_attribute a WHERE a.attrelid = {literal}::regclass AND a.attnum > 0 AND NOT a.attisdropped LOOP IF c.seq IS NOT NULL THEN EXECUTE format('SELECT MAX(%I)::bigint FROM %s', c.name, {literal}) INTO v; IF v IS NOT NULL THEN PERFORM setval(c.seq::regclass, GREATEST(v, 1), true); END IF; END IF; END LOOP; END");
+                    let mut delimiter = "$dbde_reset$".to_string();
+                    while body.contains(&delimiter) { delimiter.insert(delimiter.len()-1, '_'); }
+                    writeln!(output, "DO {delimiter} {body} {delimiter};").map_err(err)?;
+                }
+            }
+        }
+        writeln!(output, "{suffix}").map_err(err)?;
+        output.flush().map_err(err)?;
+        output.get_ref().sync_all().map_err(err)?;
+        if running.flag.load(Ordering::Relaxed) { return Err("SQL dump cancelled.".into()); }
+        std::fs::rename(&partial, &path).map_err(err)?;
+        Ok(path.display().to_string())
+    }).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    match result {
+        Ok(path) => Ok(Some(path)),
+        Err(error) if error.to_lowercase().contains("cancelled") => Ok(None),
+        Err(error) => Err(error),
     }
 }

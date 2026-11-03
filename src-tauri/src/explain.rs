@@ -374,15 +374,16 @@ pub(crate) async fn dbde_explain_query(
         Err(_) => {
             // Same recovery as the editor: cancel on the server; the dropped session
             // connection rolls back anything ANALYZE started.
+            let mut cancelled = false;
             if let Some(session_id) = &session_id {
                 if let Some(slot) = session_slot(&conn, session_id).await {
                     let server_id = slot.server_id.lock().ok().and_then(|mut id| id.take());
                     if let Some(server_id) = server_id {
-                        let _ = timed(cancel_server_query(&conn, server_id)).await;
+                        cancelled = timed(cancel_server_query(&conn, server_id)).await.is_ok();
                     }
                 }
             }
-            Err(format!("Explain timed out after {seconds} seconds and was cancelled. This tab's session was reset, so any open transaction was rolled back."))
+            Err(timeout_message("Explain", seconds, cancelled))
         }
     }
 }

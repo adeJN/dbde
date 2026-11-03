@@ -330,8 +330,22 @@ export default function ImportDialog({
         }}
       >
         <header>
-          <div className="modal-icon">
-            <Upload size={20} />
+          <div className="export-heading">
+            <div className="modal-icon">
+              <Upload size={20} />
+            </div>
+            <h2 id="import-title">
+              Import into {name}
+              <small>
+                {request.database ? `${request.database} · ` : ""}
+                {target ? count(target.columns.length, "column") : "Loading…"}
+                {target?.primary_keys.length
+                  ? ` · primary key ${target.primary_keys.join(", ")}`
+                  : target
+                    ? " · no primary key"
+                    : ""}
+              </small>
+            </h2>
           </div>
           <button
             className="icon-button"
@@ -342,18 +356,6 @@ export default function ImportDialog({
             <X size={18} />
           </button>
         </header>
-        <h2 id="import-title">
-          Import into {name}
-          <small>
-            {request.database ? `${request.database} · ` : ""}
-            {target ? count(target.columns.length, "column") : "Loading…"}
-            {target?.primary_keys.length
-              ? ` · primary key ${target.primary_keys.join(", ")}`
-              : target
-                ? " · no primary key"
-                : ""}
-          </small>
-        </h2>
         {!summary && (
           <nav className="import-steps" aria-label="Import steps">
             {STEPS.map((s, i) => (
@@ -374,411 +376,444 @@ export default function ImportDialog({
             ))}
           </nav>
         )}
-        {summary ? (
-          <ImportResult summary={summary} />
-        ) : step === "source" ? (
-          <>
-            <fieldset className="export-section">
-              <legend>File</legend>
-              <div className="import-file">
-                <button
-                  type="button"
-                  className="button secondary import-choose"
-                  disabled={busy || running}
-                  onClick={() => void choose()}
-                >
-                  <FileUp size={14} />{" "}
-                  {preview ? "Choose another file…" : "Choose file…"}
-                </button>
-                {preview && (
-                  <span className="import-file-name" title={preview.file_name}>
-                    {preview.file_name} · {formatBytes(preview.file_size)} ·{" "}
-                    {preview.exact_rows ? "" : "about "}
-                    {count(preview.estimated_rows, "row")}
-                  </span>
-                )}
-              </div>
-              <small className="export-hint">
-                CSV, TSV, JSON (an array of objects), JSON Lines
-                {api.desktop ? " or Excel (.xlsx, .xls)" : ""}, encoded as UTF-8
-                with or without BOM. At most{" "}
-                {api.desktop ? "512 MB" : "64 MB in the browser sandbox"} and{" "}
-                {MAX_IMPORT_ROWS.toLocaleString()} rows.
-              </small>
-            </fieldset>
-            {preview && options && (
-              <fieldset className="export-section">
-                <legend>Format</legend>
-                <div className="export-formats">
-                  {IMPORT_FORMATS.map((f) =>
-                    radio(
-                      "import-format",
-                      f.value,
-                      f.label,
-                      format === f.value,
-                      () =>
-                        void reparse({
-                          format: f.value as ImportFormat,
-                          delimiter: f.value === "tsv" ? "\t" : ",",
-                          sheet: undefined,
-                        }),
-                      f.value === "excel" && !api.desktop,
-                      f.value === "excel" && !api.desktop
-                        ? "Excel import requires the desktop app"
-                        : undefined,
-                    ),
+        <div className="import-body">
+          {summary ? (
+            <ImportResult summary={summary} />
+          ) : step === "source" ? (
+            <>
+              <fieldset
+                className={`export-section import-source-section${preview ? " has-file" : ""}`}
+              >
+                <legend>Source file</legend>
+                <div className="import-file">
+                  {!preview && (
+                    <div className="import-file-intro">
+                      <FileUp size={26} />
+                      <strong>Select a file to import</strong>
+                      <span>
+                        Choose your data file, then review the column mapping.
+                      </span>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="button secondary import-choose"
+                    disabled={busy || running}
+                    onClick={() => void choose()}
+                  >
+                    <FileUp size={14} />{" "}
+                    {preview ? "Choose another file…" : "Choose file…"}
+                  </button>
+                  {preview && (
+                    <span
+                      className="import-file-name"
+                      title={preview.file_name}
+                    >
+                      {preview.file_name} · {formatBytes(preview.file_size)} ·{" "}
+                      {preview.exact_rows ? "" : "about "}
+                      {count(preview.estimated_rows, "row")}
+                    </span>
                   )}
                 </div>
-                {delimited && (
-                  <div className="form-row">
-                    {format === "csv" && (
-                      <label>
-                        Delimiter
-                        <select
-                          value={options.delimiter}
-                          disabled={busy || running}
-                          onChange={(e) =>
-                            void reparse({ delimiter: e.target.value })
-                          }
-                        >
-                          {DELIMITERS.map((d) => (
-                            <option key={d.label} value={d.value}>
-                              {d.label}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
+                <div
+                  className="import-file-formats"
+                  aria-label="Supported file formats"
+                >
+                  <span>CSV / TSV</span>
+                  <span>JSON / JSON Lines</span>
+                  {api.desktop && <span>Excel .xlsx / .xls</span>}
+                </div>
+                <small className="export-hint import-file-limits">
+                  UTF-8 with or without BOM · Up to{" "}
+                  {api.desktop ? "512 MB" : "64 MB in the browser sandbox"} ·{" "}
+                  {MAX_IMPORT_ROWS.toLocaleString()} rows
+                </small>
+              </fieldset>
+              {preview && options && (
+                <fieldset className="export-section">
+                  <legend>Format</legend>
+                  <div className="export-formats">
+                    {IMPORT_FORMATS.map((f) =>
+                      radio(
+                        "import-format",
+                        f.value,
+                        f.label,
+                        format === f.value,
+                        () =>
+                          void reparse({
+                            format: f.value as ImportFormat,
+                            delimiter: f.value === "tsv" ? "\t" : ",",
+                            sheet: undefined,
+                          }),
+                        f.value === "excel" && !api.desktop,
+                        f.value === "excel" && !api.desktop
+                          ? "Excel import requires the desktop app"
+                          : undefined,
+                      ),
                     )}
-                    <label>
-                      Quote character
-                      <select
-                        value={options.quote}
-                        disabled={busy || running}
-                        onChange={(e) =>
-                          void reparse({ quote: e.target.value })
-                        }
-                      >
-                        {QUOTES.map((q) => (
-                          <option key={q.label} value={q.value}>
-                            {q.label}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
                   </div>
-                )}
-                {format === "excel" && (
-                  <label>
-                    Sheet
-                    <select
-                      value={options.sheet ?? ""}
-                      disabled={busy || running}
-                      onChange={(e) => void reparse({ sheet: e.target.value })}
-                    >
-                      {preview.sheets.map((sheet) => (
-                        <option key={sheet} value={sheet}>
-                          {sheet}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                )}
-                {(delimited || format === "excel") && (
-                  <>
-                    <label className="export-choice">
-                      <input
-                        type="checkbox"
-                        checked={options.header}
-                        disabled={busy || running}
-                        onChange={(e) =>
-                          void reparse({ header: e.target.checked })
-                        }
-                      />
-                      <span>First row contains column names</span>
-                    </label>
+                  {delimited && (
                     <div className="form-row">
+                      {format === "csv" && (
+                        <label>
+                          Delimiter
+                          <select
+                            value={options.delimiter}
+                            disabled={busy || running}
+                            onChange={(e) =>
+                              void reparse({ delimiter: e.target.value })
+                            }
+                          >
+                            {DELIMITERS.map((d) => (
+                              <option key={d.label} value={d.value}>
+                                {d.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
                       <label>
-                        NULL marker
+                        Quote character
                         <select
-                          value={
-                            NULL_MARKERS.some(
-                              (m) => m.value === options.null_text,
-                            )
-                              ? options.null_text
-                              : "custom"
-                          }
+                          value={options.quote}
                           disabled={busy || running}
                           onChange={(e) =>
-                            void reparse({
-                              null_text:
-                                e.target.value === "custom"
-                                  ? "NULL"
-                                  : e.target.value,
-                            })
+                            void reparse({ quote: e.target.value })
                           }
                         >
-                          {NULL_MARKERS.map((m) => (
-                            <option key={m.label} value={m.value}>
-                              {m.label}
+                          {QUOTES.map((q) => (
+                            <option key={q.label} value={q.value}>
+                              {q.label}
                             </option>
                           ))}
                         </select>
                       </label>
                     </div>
-                    <small className="export-hint">
-                      {options.null_text
-                        ? `Cells containing exactly ${options.null_text} become NULL; empty cells stay empty strings.`
-                        : "Empty cells become NULL."}{" "}
-                      Numbers and dates are passed as text and converted by the
-                      database.
-                    </small>
-                  </>
-                )}
-                {(format === "json" || format === "jsonl") && (
-                  <small className="export-hint">
-                    JSON null becomes NULL and missing keys are NULL. Nested
-                    objects and arrays are imported as JSON text.
-                  </small>
-                )}
-              </fieldset>
-            )}
-            {preview && (
-              <fieldset className="export-section">
-                <legend>
-                  Preview
-                  <span className="import-legend-note">
-                    {count(preview.rows.length, "row")} ·{" "}
-                    {count(preview.columns.length, "column")}
-                  </span>
-                </legend>
-                <div
-                  className="import-preview"
-                  tabIndex={0}
-                  aria-label="File preview"
-                >
-                  <table>
-                    <thead>
-                      <tr>
-                        {preview.columns.map((column) => (
-                          <th key={column}>{column}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {preview.rows.map((row, r) => (
-                        <tr key={r}>
-                          {row.map((value, c) => (
-                            <td
-                              key={c}
-                              className={value === null ? "null" : ""}
-                            >
-                              {value ?? "NULL"}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {preview.row_errors.length > 0 && (
-                  <small className="export-hint import-warning">
-                    {preview.row_errors
-                      .slice(0, 3)
-                      .map((e) => `Row ${e.row}: ${e.message}`)
-                      .join(" ")}
-                  </small>
-                )}
-              </fieldset>
-            )}
-          </>
-        ) : step === "mapping" && preview && target ? (
-          <fieldset className="export-section">
-            <legend>
-              Map source columns to {table.name}
-              <span className="export-legend-actions">
-                <button
-                  type="button"
-                  className="link-button"
-                  disabled={running}
-                  onClick={() =>
-                    setMapping(autoMapping(preview.columns, target))
-                  }
-                >
-                  Match by name
-                </button>
-                <button
-                  type="button"
-                  className="link-button"
-                  disabled={running}
-                  onClick={() =>
-                    setMapping(
-                      Object.fromEntries(preview.columns.map((c) => [c, SKIP])),
-                    )
-                  }
-                >
-                  Skip all
-                </button>
-              </span>
-            </legend>
-            <div
-              className="import-mapping"
-              role="table"
-              aria-label="Column mapping"
-            >
-              <div role="row" className="import-mapping-head">
-                <span role="columnheader">Source</span>
-                <span role="columnheader">Target column</span>
-                <span role="columnheader">Type</span>
-              </div>
-              {preview.columns.map((source, i) => {
-                const chosen = targetColumn(mapping[source] ?? SKIP);
-                return (
-                  <div role="row" key={source}>
-                    <span
-                      role="cell"
-                      className="import-source"
-                      title={sample(i)}
-                    >
-                      {source}
-                      <small>{sample(i)}</small>
-                    </span>
-                    <span role="cell">
+                  )}
+                  {format === "excel" && (
+                    <label>
+                      Sheet
                       <select
-                        aria-label={`Target for ${source}`}
-                        value={mapping[source] ?? SKIP}
-                        disabled={running}
+                        value={options.sheet ?? ""}
+                        disabled={busy || running}
                         onChange={(e) =>
-                          setMapping((current) => ({
-                            ...current,
-                            [source]: e.target.value,
-                          }))
+                          void reparse({ sheet: e.target.value })
                         }
                       >
-                        <option value={SKIP}>Skip</option>
-                        {target.columns.map((c) => (
-                          <option
-                            key={c.name}
-                            value={c.name}
-                            disabled={c.generated}
-                          >
-                            {c.name}
-                            {target.primary_keys.includes(c.name)
-                              ? " (key)"
-                              : ""}
-                            {c.generated ? " (generated)" : ""}
+                        {preview.sheets.map((sheet) => (
+                          <option key={sheet} value={sheet}>
+                            {sheet}
                           </option>
                         ))}
                       </select>
+                    </label>
+                  )}
+                  {(delimited || format === "excel") && (
+                    <>
+                      <label className="export-choice">
+                        <input
+                          type="checkbox"
+                          checked={options.header}
+                          disabled={busy || running}
+                          onChange={(e) =>
+                            void reparse({ header: e.target.checked })
+                          }
+                        />
+                        <span>First row contains column names</span>
+                      </label>
+                      <div className="form-row">
+                        <label>
+                          NULL marker
+                          <select
+                            value={
+                              NULL_MARKERS.some(
+                                (m) => m.value === options.null_text,
+                              )
+                                ? options.null_text
+                                : "custom"
+                            }
+                            disabled={busy || running}
+                            onChange={(e) =>
+                              void reparse({
+                                null_text:
+                                  e.target.value === "custom"
+                                    ? "NULL"
+                                    : e.target.value,
+                              })
+                            }
+                          >
+                            {NULL_MARKERS.map((m) => (
+                              <option key={m.label} value={m.value}>
+                                {m.label}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                      <small className="export-hint">
+                        {options.null_text
+                          ? `Cells containing exactly ${options.null_text} become NULL; empty cells stay empty strings.`
+                          : "Empty cells become NULL."}{" "}
+                        Numbers and dates are passed as text and converted by
+                        the database.
+                      </small>
+                    </>
+                  )}
+                  {(format === "json" || format === "jsonl") && (
+                    <small className="export-hint">
+                      JSON null becomes NULL and missing keys are NULL. Nested
+                      objects and arrays are imported as JSON text.
+                    </small>
+                  )}
+                </fieldset>
+              )}
+              {preview && (
+                <fieldset className="export-section">
+                  <legend>
+                    Preview
+                    <span className="import-legend-note">
+                      {count(preview.rows.length, "row")} ·{" "}
+                      {count(preview.columns.length, "column")}
                     </span>
-                    <span role="cell" className="import-type">
-                      {chosen
-                        ? `${chosen.data_type || "any"}${chosen.nullable ? "" : " · NOT NULL"}`
-                        : "—"}
-                    </span>
+                  </legend>
+                  <div
+                    className="import-preview"
+                    tabIndex={0}
+                    aria-label="File preview"
+                  >
+                    <table>
+                      <thead>
+                        <tr>
+                          {preview.columns.map((column) => (
+                            <th key={column}>{column}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {preview.rows.map((row, r) => (
+                          <tr key={r}>
+                            {row.map((value, c) => (
+                              <td
+                                key={c}
+                                className={value === null ? "null" : ""}
+                              >
+                                {value ?? "NULL"}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                );
-              })}
+                  {preview.row_errors.length > 0 && (
+                    <small className="export-hint import-warning">
+                      {preview.row_errors
+                        .slice(0, 3)
+                        .map((e) => `Row ${e.row}: ${e.message}`)
+                        .join(" ")}
+                    </small>
+                  )}
+                </fieldset>
+              )}
+            </>
+          ) : step === "mapping" && preview && target ? (
+            <fieldset className="export-section">
+              <legend>
+                Map source columns to {table.name}
+                <span className="export-legend-actions">
+                  <button
+                    type="button"
+                    className="link-button"
+                    disabled={running}
+                    onClick={() =>
+                      setMapping(autoMapping(preview.columns, target))
+                    }
+                  >
+                    Match by name
+                  </button>
+                  <button
+                    type="button"
+                    className="link-button"
+                    disabled={running}
+                    onClick={() =>
+                      setMapping(
+                        Object.fromEntries(
+                          preview.columns.map((c) => [c, SKIP]),
+                        ),
+                      )
+                    }
+                  >
+                    Skip all
+                  </button>
+                </span>
+              </legend>
+              <div
+                className="import-mapping"
+                role="table"
+                aria-label="Column mapping"
+              >
+                <div role="row" className="import-mapping-head">
+                  <span role="columnheader">Source</span>
+                  <span role="columnheader">Target column</span>
+                  <span role="columnheader">Type</span>
+                </div>
+                {preview.columns.map((source, i) => {
+                  const chosen = targetColumn(mapping[source] ?? SKIP);
+                  return (
+                    <div role="row" key={source}>
+                      <span
+                        role="cell"
+                        className="import-source"
+                        title={sample(i)}
+                      >
+                        {source}
+                        <small>{sample(i)}</small>
+                      </span>
+                      <span role="cell">
+                        <select
+                          aria-label={`Target for ${source}`}
+                          value={mapping[source] ?? SKIP}
+                          disabled={running}
+                          onChange={(e) =>
+                            setMapping((current) => ({
+                              ...current,
+                              [source]: e.target.value,
+                            }))
+                          }
+                        >
+                          <option value={SKIP}>Skip</option>
+                          {target.columns.map((c) => (
+                            <option
+                              key={c.name}
+                              value={c.name}
+                              disabled={c.generated}
+                            >
+                              {c.name}
+                              {target.primary_keys.includes(c.name)
+                                ? " (key)"
+                                : ""}
+                              {c.generated ? " (generated)" : ""}
+                            </option>
+                          ))}
+                        </select>
+                      </span>
+                      <span role="cell" className="import-type">
+                        {chosen
+                          ? `${chosen.data_type || "any"}${chosen.nullable ? "" : " · NOT NULL"}`
+                          : "—"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              {required.length > 0 && (
+                <div
+                  className="form-message error import-required"
+                  role="alert"
+                >
+                  Required column{required.length === 1 ? "" : "s"} not mapped
+                  (NOT NULL without a default): {required.join(", ")}
+                </div>
+              )}
+            </fieldset>
+          ) : step === "options" && target ? (
+            <>
+              <fieldset className="export-section">
+                <legend>Import mode</legend>
+                {IMPORT_MODES.map((m) => {
+                  const needsKey =
+                    (m.value === "update" || m.value === "upsert") &&
+                    !target.primary_keys.length;
+                  const needsTransaction =
+                    m.value === "copy" && !target.transactional;
+                  return (
+                    <label key={m.value} className="export-choice import-mode">
+                      <input
+                        type="radio"
+                        name="import-mode"
+                        value={m.value}
+                        checked={mode === m.value}
+                        disabled={running || needsKey || needsTransaction}
+                        onChange={() => setMode(m.value)}
+                      />
+                      <span>
+                        {m.label}
+                        <small>
+                          {needsKey
+                            ? "Requires a primary key."
+                            : needsTransaction
+                              ? "Requires a transactional (InnoDB) table."
+                              : m.description}
+                        </small>
+                      </span>
+                    </label>
+                  );
+                })}
+              </fieldset>
+              <fieldset className="export-section">
+                <legend>Errors</legend>
+                <label className="export-choice">
+                  <input
+                    type="checkbox"
+                    checked={continueOnError}
+                    disabled={running}
+                    onChange={(e) => setContinueOnError(e.target.checked)}
+                  />
+                  <span>
+                    Continue on error (skip rejected rows and report them)
+                  </span>
+                </label>
+                <small className="export-hint">
+                  {!target.transactional
+                    ? "This table's storage engine cannot roll back, so rows are written one by one and stay written even if the import is cancelled."
+                    : continueOnError
+                      ? "Rows the database rejects are skipped; all other rows are imported."
+                      : "The whole import runs in one transaction: if any row fails or you cancel, nothing is imported."}
+                </small>
+              </fieldset>
+              {preview && (
+                <small className="export-hint">
+                  {count(mapped.length, "column")} from {preview.file_name} into{" "}
+                  {name}, {preview.exact_rows ? "" : "about "}
+                  {count(preview.estimated_rows, "row")}.
+                </small>
+              )}
+            </>
+          ) : null}
+          {running && (
+            <div className="export-progress" role="status">
+              <Loader2 size={14} className="spin" /> Importing…{" "}
+              {count(progress, "row")} processed
+              {preview
+                ? ` of ${preview.exact_rows ? "" : "about "}${preview.estimated_rows.toLocaleString()}`
+                : ""}
             </div>
-            {required.length > 0 && (
-              <div className="form-message error import-required" role="alert">
-                Required column{required.length === 1 ? "" : "s"} not mapped
-                (NOT NULL without a default): {required.join(", ")}
+          )}
+          {busy && !running && (
+            <div className="export-progress" role="status">
+              <Loader2 size={14} className="spin" /> Reading file…
+            </div>
+          )}
+          {!running && info && (
+            <div className="form-message" role="status">
+              {info}
+            </div>
+          )}
+          {!running && failure && (
+            <div className="form-message error" role="alert">
+              {failure}
+            </div>
+          )}
+          {!running &&
+            !failure &&
+            !summary &&
+            step === "options" &&
+            problem && (
+              <div className="form-message error" role="alert">
+                {problem}
               </div>
             )}
-          </fieldset>
-        ) : step === "options" && target ? (
-          <>
-            <fieldset className="export-section">
-              <legend>Import mode</legend>
-              {IMPORT_MODES.map((m) => {
-                const needsKey =
-                  (m.value === "update" || m.value === "upsert") &&
-                  !target.primary_keys.length;
-                const needsTransaction =
-                  m.value === "copy" && !target.transactional;
-                return (
-                  <label key={m.value} className="export-choice import-mode">
-                    <input
-                      type="radio"
-                      name="import-mode"
-                      value={m.value}
-                      checked={mode === m.value}
-                      disabled={running || needsKey || needsTransaction}
-                      onChange={() => setMode(m.value)}
-                    />
-                    <span>
-                      {m.label}
-                      <small>
-                        {needsKey
-                          ? "Requires a primary key."
-                          : needsTransaction
-                            ? "Requires a transactional (InnoDB) table."
-                            : m.description}
-                      </small>
-                    </span>
-                  </label>
-                );
-              })}
-            </fieldset>
-            <fieldset className="export-section">
-              <legend>Errors</legend>
-              <label className="export-choice">
-                <input
-                  type="checkbox"
-                  checked={continueOnError}
-                  disabled={running}
-                  onChange={(e) => setContinueOnError(e.target.checked)}
-                />
-                <span>
-                  Continue on error (skip rejected rows and report them)
-                </span>
-              </label>
-              <small className="export-hint">
-                {!target.transactional
-                  ? "This table's storage engine cannot roll back, so rows are written one by one and stay written even if the import is cancelled."
-                  : continueOnError
-                    ? "Rows the database rejects are skipped; all other rows are imported."
-                    : "The whole import runs in one transaction: if any row fails or you cancel, nothing is imported."}
-              </small>
-            </fieldset>
-            {preview && (
-              <small className="export-hint">
-                {count(mapped.length, "column")} from {preview.file_name} into{" "}
-                {name}, {preview.exact_rows ? "" : "about "}
-                {count(preview.estimated_rows, "row")}.
-              </small>
-            )}
-          </>
-        ) : null}
-        {running && (
-          <div className="export-progress" role="status">
-            <Loader2 size={14} className="spin" /> Importing…{" "}
-            {count(progress, "row")} processed
-            {preview
-              ? ` of ${preview.exact_rows ? "" : "about "}${preview.estimated_rows.toLocaleString()}`
-              : ""}
-          </div>
-        )}
-        {busy && !running && (
-          <div className="export-progress" role="status">
-            <Loader2 size={14} className="spin" /> Reading file…
-          </div>
-        )}
-        {!running && info && (
-          <div className="form-message" role="status">
-            {info}
-          </div>
-        )}
-        {!running && failure && (
-          <div className="form-message error" role="alert">
-            {failure}
-          </div>
-        )}
-        {!running && !failure && !summary && step === "options" && problem && (
-          <div className="form-message error" role="alert">
-            {problem}
-          </div>
-        )}
+        </div>
         <footer>
           {summary ? (
             <button type="button" className="button primary" onClick={onClose}>
@@ -788,7 +823,7 @@ export default function ImportDialog({
             <>
               <button
                 type="button"
-                className="button secondary"
+                className="button secondary import-cancel"
                 onClick={cancel}
               >
                 {running ? "Cancel import" : "Cancel"}

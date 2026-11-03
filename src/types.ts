@@ -169,6 +169,8 @@ export interface QueryTab {
   connectionId: string;
   database?: string;
   query: string;
+  /** Exact SQL that produced the current query result, including a selected subset. */
+  lastExecutedQuery?: string;
   result?: QueryResult;
   error?: string;
   running: boolean;

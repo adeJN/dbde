@@ -164,18 +164,24 @@ pub(crate) async fn dbde_drop_table(
     .await
 }
 
-async fn writable_columns(conn: &Connection, table: &TableInfo) -> DbResult<Vec<String>> {
+pub(crate) async fn writable_columns(
+    conn: &Connection,
+    table: &TableInfo,
+) -> DbResult<Vec<String>> {
     match &conn.pool {
         Pool::Pg(p) => sqlx::query_scalar("SELECT a.attname::text FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = '' ORDER BY a.attnum")
             .bind(&table.schema).bind(&table.name).fetch_all(p).await.map_err(err),
-        Pool::My(p) => sqlx::query_scalar("SELECT CAST(column_name AS CHAR) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND COALESCE(generation_expression, '') = '' ORDER BY ordinal_position")
-            .bind(&table.name).fetch_all(p).await.map_err(err),
+        Pool::My(p) => {
+            let rows = sqlx::query("SELECT column_name FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND COALESCE(generation_expression, '') = '' ORDER BY ordinal_position")
+                .bind(&table.name).fetch_all(p).await.map_err(err)?;
+            rows.iter().map(|row| mysql_metadata_text(row, 0)).collect()
+        },
         Pool::Lite(p) => sqlx::query_scalar("SELECT name FROM pragma_table_xinfo(?) WHERE hidden = 0 ORDER BY cid")
             .bind(&table.name).fetch_all(p).await.map_err(err),
     }
 }
 // Find the definition's opening parenthesis outside quoted identifiers.
-fn definition_body(sql: &str) -> DbResult<&str> {
+pub(crate) fn definition_body(sql: &str) -> DbResult<&str> {
     let mut quoted = None;
     for (i, ch) in sql.char_indices() {
         if let Some(q) = quoted {
@@ -347,6 +353,7 @@ pub(crate) struct CopyDestination {
     database: String,
 }
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // IPC fields include the streaming progress channel.
 pub(crate) async fn dbde_copy_table(
     connection_id: String,
     database: String,
@@ -354,8 +361,14 @@ pub(crate) async fn dbde_copy_table(
     target: TableInfo,
     data: bool,
     destination: Option<CopyDestination>,
+    on_progress: tauri::ipc::Channel<cross_copy::CopyProgress>,
+    operation_id: Option<String>,
+    operations: State<'_, operations::Operations>,
     state: State<'_, AppState>,
 ) -> DbResult<()> {
+    let running =
+        operations.start(operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()))?;
+    cross_copy::report(Some(&on_progress), "Preparing table copy", None);
     let conn = database_connection(&state, &connection_id, Some(&database)).await?;
     let mut target = target;
     if let Some(request) = destination {
@@ -373,10 +386,40 @@ pub(crate) async fn dbde_copy_table(
             connection_id == target_id,
         )?;
         if matches!(conn.config.driver, Driver::Mysql) {
-            target.schema = target_database;
+            target.schema = target_database.clone();
+            if !same_server(&conn.config, &destination.config) {
+                let destination =
+                    database_connection(&state, &target_id, Some(&target_database)).await?;
+                return cross_copy::copy_mysql_table_controlled(
+                    &conn,
+                    &table,
+                    &destination,
+                    &target,
+                    data,
+                    Some(&on_progress),
+                    &running.flag,
+                )
+                .await;
+            }
         }
     }
-    copy_table(&conn, &table, &target, data).await
+    cross_copy::report(
+        Some(&on_progress),
+        "Copying structure and records on server",
+        None,
+    );
+    operations::controlled(
+        &running.flag,
+        conn.config
+            .options
+            .query_timeout_secs
+            .unwrap_or(300)
+            .max(300),
+        copy_table(&conn, &table, &target, data),
+    )
+    .await?;
+    cross_copy::report(Some(&on_progress), "Table copied", None);
+    Ok(())
 }
 fn validate_copy_destination(
     source: &ConnectionConfig,
@@ -389,7 +432,7 @@ fn validate_copy_destination(
         return Err("Table copy requires matching database engines. Use Transfer records for different engines.".into());
     }
     match source.driver {
-        Driver::Mysql if same_server(source, target) => Ok(()),
+        Driver::Mysql => Ok(()),
         Driver::Postgres if same_server(source, target) && source_database == target_database => Ok(()),
         Driver::Sqlite if same_connection => Ok(()),
         _ => Err("Direct table copy supports MySQL/MariaDB databases on the same server, or the same PostgreSQL/SQLite database. Use export/import for another server or database engine.".into()),
@@ -486,7 +529,7 @@ mod tests {
         target.database = "archive".into();
         assert!(validate_copy_destination(&source, &target, "shop", "archive", false).is_ok());
         target.host = "another-server".into();
-        assert!(validate_copy_destination(&source, &target, "shop", "archive", false).is_err());
+        assert!(validate_copy_destination(&source, &target, "shop", "archive", false).is_ok());
         target = source.clone();
         target.driver = Driver::Postgres;
         assert!(validate_copy_destination(&source, &target, "shop", "archive", false).is_err());

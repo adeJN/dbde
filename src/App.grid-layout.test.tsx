@@ -23,6 +23,7 @@ vi.mock("./components/QueryEditor", () => ({
 }));
 vi.mock("./lib/api", () => ({
   desktop: true,
+  guardMainWindowClose: vi.fn().mockResolvedValue(() => {}),
   columns: async () => [],
   listProfiles: vi.fn().mockResolvedValue([]),
   connect: vi.fn(),

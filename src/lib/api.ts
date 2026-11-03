@@ -1,4 +1,5 @@
-import { Channel, invoke, isTauri } from "@tauri-apps/api/core";
+import { Channel, isTauri } from "@tauri-apps/api/core";
+import { trackedInvoke as invoke } from "./tracked-invoke";
 import { useWorkspace } from "../store";
 import {
   connectionKey,
@@ -76,6 +77,64 @@ import {
   type HistoryEntry,
 } from "./query-history";
 export const desktop = isTauri();
+export async function dumpSqlFile(
+  connectionId: string,
+  database: string,
+  tables: TableInfo[],
+  prefix: string,
+  suffix: string,
+  data: boolean,
+): Promise<string | null> {
+  return invoke("dbde_dump_sql", {
+    connectionId,
+    database,
+    tables,
+    prefix,
+    suffix,
+    data,
+    operationId: crypto.randomUUID(),
+  });
+}
+export async function readTableSnapshot(
+  connectionId: string,
+  database: string,
+  table: TableInfo,
+  limit: number,
+  onProgress?: (rows: number) => void,
+): Promise<QueryResult> {
+  const result = await invoke<QueryResult>("dbde_read_table_snapshot", {
+    connectionId,
+    database,
+    table,
+    limit,
+  });
+  onProgress?.(result.rows.length);
+  return result;
+}
+export async function transferRecords(
+  connectionId: string,
+  database: string,
+  table: TableInfo,
+  targetConnectionId: string,
+  targetDatabase: string,
+  target: TableInfo,
+  mapping: { source: string; target: string }[],
+  operationId: string,
+): Promise<number> {
+  return invoke("dbde_transfer_records", {
+    connectionId,
+    database,
+    table,
+    targetConnectionId,
+    targetDatabase,
+    target,
+    mapping,
+    operationId,
+  });
+}
+export async function cancelOperation(operationId: string): Promise<void> {
+  if (desktop) await invoke("dbde_cancel_operation", { operationId });
+}
 export async function closeDetachedWindow(): Promise<void> {
   await invoke("dbde_close_detached_window");
 }
@@ -90,6 +149,24 @@ export async function guardDetachedWindowClose(
     checking = true;
     try {
       if (await approve()) await invoke("dbde_close_detached_window");
+    } finally {
+      checking = false;
+    }
+  });
+}
+export async function guardMainWindowClose(
+  approve: () => Promise<boolean>,
+): Promise<() => void> {
+  const { listen } = await import("@tauri-apps/api/event");
+  let checking = false;
+  return listen("dbde-close-requested", async () => {
+    if (checking) return;
+    checking = true;
+    try {
+      if (await approve()) await invoke("dbde_finish_close");
+    } catch (cause) {
+      const { useProcessReports } = await import("./process-reports");
+      useProcessReports.getState().notify(String(cause));
     } finally {
       checking = false;
     }
@@ -969,11 +1046,11 @@ export const cancelQuery = (
   desktop
     ? invoke("dbde_cancel_query", { connectionId, sessionId })
     : Promise.resolve(false);
-/** Whether the tab's server session holds an uncommitted transaction. */
+/** Whether the tab holds a transaction; null means its state could not be checked. */
 export const sessionInTransaction = (
   connectionId: string,
   sessionId: string,
-): Promise<boolean> =>
+): Promise<boolean | null> =>
   desktop
     ? invoke("dbde_session_in_transaction", { connectionId, sessionId })
     : Promise.resolve(false);
@@ -1673,6 +1750,7 @@ export async function copyTable(
   table: TableInfo,
   target: TableInfo,
   data: boolean,
+  operationId?: string,
 ): Promise<void> {
   if (desktop)
     return invoke("dbde_copy_table", {
@@ -1681,6 +1759,7 @@ export async function copyTable(
       table,
       target,
       data,
+      ...(operationId ? { operationId } : {}),
     });
   if (
     table.kind !== "table" ||
@@ -1756,6 +1835,7 @@ export async function pasteTable(
   targetDatabase: string,
   target: TableInfo,
   data: boolean,
+  operationId?: string,
 ): Promise<void> {
   if (desktop)
     return invoke("dbde_copy_table", {
@@ -1764,6 +1844,7 @@ export async function pasteTable(
       table,
       target,
       data,
+      operationId,
       destination: {
         connectionId: targetConnectionId,
         database: targetDatabase,
@@ -1775,6 +1856,37 @@ export async function pasteTable(
   )
     throw new Error("Copying to another database requires the desktop app.");
   await copyTable(sourceConnectionId, sourceDatabase, table, target, data);
+}
+export interface TableCopyProgress {
+  stage: string;
+  rows?: number;
+  tables_copied?: number;
+  table_index?: number;
+  phase?: string;
+}
+/** Copies a related MySQL-compatible group privately, then publishes it together. */
+export async function pasteTables(
+  sourceConnectionId: string,
+  sourceDatabase: string,
+  targetConnectionId: string,
+  targetDatabase: string,
+  items: { table: TableInfo; target: TableInfo }[],
+  data: boolean,
+  operationId: string,
+  onProgress: (progress: TableCopyProgress) => void,
+): Promise<void> {
+  const channel = new Channel<TableCopyProgress>();
+  channel.onmessage = onProgress;
+  return invoke("dbde_copy_tables", {
+    connectionId: sourceConnectionId,
+    database: sourceDatabase,
+    destinationConnectionId: targetConnectionId,
+    destinationDatabase: targetDatabase,
+    items,
+    data,
+    operationId,
+    onProgress: channel,
+  });
 }
 export async function clearTable(
   connectionId: string,

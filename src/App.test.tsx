@@ -12,14 +12,21 @@ import {
 import App from "./App";
 import { useWorkspace } from "./store";
 import type { ConnectionConfig, QueryResult } from "./types";
-const { viewTable, deleteRows, applyChanges, connect, listProfiles } =
-  vi.hoisted(() => ({
-    connect: vi.fn(),
-    listProfiles: vi.fn().mockResolvedValue([]),
-    viewTable: vi.fn(),
-    deleteRows: vi.fn(),
-    applyChanges: vi.fn(),
-  }));
+const {
+  viewTable,
+  deleteRows,
+  applyChanges,
+  connect,
+  listProfiles,
+  deleteProfile,
+} = vi.hoisted(() => ({
+  connect: vi.fn(),
+  deleteProfile: vi.fn(),
+  listProfiles: vi.fn().mockResolvedValue([]),
+  viewTable: vi.fn(),
+  deleteRows: vi.fn(),
+  applyChanges: vi.fn(),
+}));
 vi.mock("@tanstack/react-virtual", () => ({
   useVirtualizer: ({ count }: { count: number }) => ({
     getTotalSize: () => count * 37,
@@ -39,11 +46,13 @@ vi.mock("./components/QueryEditor", () => ({
 }));
 vi.mock("./lib/api", () => ({
   desktop: true,
+  guardMainWindowClose: vi.fn().mockResolvedValue(() => {}),
   columns: async () => [
     { name: "id", data_type: "INTEGER", nullable: false },
     { name: "name", data_type: "TEXT", nullable: true },
   ],
   listProfiles,
+  deleteProfile,
   connect,
   viewTable,
   deleteRows,
@@ -78,6 +87,8 @@ const result: QueryResult = {
 };
 beforeEach(() => {
   connect.mockReset();
+  deleteProfile.mockReset();
+  deleteProfile.mockResolvedValue(undefined);
   listProfiles.mockResolvedValue([]);
   deleteRows.mockReset();
   deleteRows.mockResolvedValue(1);
@@ -381,4 +392,69 @@ it("replaces browser context menus with workspace and text actions", async () =>
     screen.getByRole("menu", { name: "Text editing actions" }),
   ).toBeTruthy();
   expect(screen.queryByRole("menu", { name: "Workspace actions" })).toBeNull();
+});
+
+describe("saved connection deletion confirmation", () => {
+  const saved = { ...config, id: "saved-only", name: "Saved production" };
+  async function openPrompt() {
+    listProfiles.mockResolvedValue([saved]);
+    render(<App />);
+    fireEvent.click(
+      await screen.findByRole("button", {
+        name: "Remove Saved production",
+      }),
+    );
+    return screen.findByRole("alertdialog");
+  }
+  it("keeps the profile until explicitly confirmed and lets Cancel dismiss it", async () => {
+    const dialog = await openPrompt();
+    expect(within(dialog).getByText("Saved production")).toBeTruthy();
+    expect(deleteProfile).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(
+      within(dialog).getByRole("button", { name: "Cancel" }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(deleteProfile).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", {
+        name: "Remove Saved production",
+      }),
+    ).toBeTruthy();
+  });
+  it("deletes only the chosen saved profile after confirmation", async () => {
+    const dialog = await openPrompt();
+    listProfiles.mockResolvedValue([]);
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Delete Connection",
+      }),
+    );
+    await waitFor(() =>
+      expect(deleteProfile).toHaveBeenCalledExactlyOnceWith("saved-only"),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", {
+          name: "Remove Saved production",
+        }),
+      ).toBeNull(),
+    );
+    expect(useWorkspace.getState().sessions).toHaveLength(1);
+  });
+  it("keeps the saved connection visible when deletion fails", async () => {
+    const dialog = await openPrompt();
+    deleteProfile.mockRejectedValueOnce(new Error("Cannot remove credentials"));
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Delete Connection",
+      }),
+    );
+    await screen.findByText(/Cannot remove credentials/);
+    expect(
+      screen.getByRole("button", {
+        name: "Remove Saved production",
+      }),
+    ).toBeTruthy();
+  });
 });

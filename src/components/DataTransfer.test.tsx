@@ -11,6 +11,7 @@ import DataTransfer from "./DataTransfer";
 import * as api from "../lib/api";
 import type { Session } from "../types";
 vi.mock("../lib/api", () => ({
+  desktop: false,
   schema: vi.fn(),
   exportColumns: vi.fn(),
   applyChanges: vi.fn(),

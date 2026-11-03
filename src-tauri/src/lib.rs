@@ -11,14 +11,19 @@ use std::{
 };
 use tauri::{Manager, State};
 use tokio::sync::Mutex;
+mod batch_copy;
+mod bulk;
 mod column_meta;
 mod connection_options;
+mod cross_copy;
 mod database_actions;
 mod explain;
 mod export;
 mod import;
+mod lifecycle;
 mod maintain;
 mod objects;
+mod operations;
 mod query_library;
 mod rows;
 mod schema;
@@ -75,6 +80,7 @@ enum SessionConn {
 struct Session {
     conn: SessionConn,
     database: String,
+    last_used: Instant,
 }
 struct SessionState {
     session: Mutex<Option<Session>>,
@@ -248,7 +254,13 @@ async fn make_pool(
 ) -> DbResult<(Pool, Option<Arc<ssh_tunnel::Tunnel>>)> {
     validate(config)?;
     let tunnel = ssh_tunnel::open(config, state).await?;
-    let pool = make_pool_at(config, state, tunnel.as_deref()).await?;
+    let pool = make_pool_at(config, state, tunnel.as_deref())
+        .await
+        .map_err(|cause| {
+            tunnel
+                .as_ref()
+                .map_or_else(|| cause.clone(), |t| t.connection_error(&cause))
+        })?;
     Ok((pool, tunnel))
 }
 async fn make_pool_at(
@@ -401,7 +413,11 @@ async fn database_connection(
                         .connect_with(options)
                         .await
                         .map(Pool::Pg)
-                        .map_err(err)?
+                        .map_err(|cause| {
+                            conn.tunnel
+                                .as_ref()
+                                .map_or_else(|| err(&cause), |t| t.connection_error(&cause))
+                        })?
                 }
                 Pool::My(p) => {
                     let options = p.connect_options().as_ref().clone().database(database);
@@ -409,7 +425,11 @@ async fn database_connection(
                         .connect_with(options)
                         .await
                         .map(Pool::My)
-                        .map_err(err)?
+                        .map_err(|cause| {
+                            conn.tunnel
+                                .as_ref()
+                                .map_or_else(|| err(&cause), |t| t.connection_error(&cause))
+                        })?
                 }
                 Pool::Lite(p) => Pool::Lite(p.clone()),
             };
@@ -512,19 +532,23 @@ async fn cancel_server_query(conn: &Connection, server_id: u64) -> DbResult<()> 
     match &conn.pool {
         Pool::Pg(p) => {
             let pid = i32::try_from(server_id).map_err(err)?;
-            sqlx::query("SELECT pg_cancel_backend($1)")
+            let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
                 .bind(pid)
-                .execute(p)
+                .fetch_one(p)
                 .await
-                .map(|_| ())
-                .map_err(err)
+                .map_err(err)?;
+            if cancelled {
+                Ok(())
+            } else {
+                Err("The server did not confirm query cancellation".into())
+            }
         }
         Pool::My(p) => match sqlx::raw_sql(&format!("KILL QUERY {server_id}"))
             .execute(p)
             .await
         {
-            // The thread may already be gone after a dropped session.
-            Ok(_) | Err(sqlx::Error::Database(_)) => Ok(()),
+            // Permission failures and already-closed threads do not acknowledge cancellation.
+            Ok(_) => Ok(()),
             Err(e) => Err(err(e)),
         },
         Pool::Lite(_) => Err("SQLite queries cannot be cancelled".into()),
@@ -549,31 +573,31 @@ async fn dbde_cancel_query(
     timed(cancel_server_query(&conn, server_id)).await?;
     Ok(true)
 }
-async fn session_in_transaction(session: &mut Session) -> bool {
+async fn session_in_transaction(session: &mut Session) -> Option<bool> {
     match &mut session.conn {
         // Inside a transaction block the transaction started before this statement.
-        // An aborted transaction rejects the query, which also means one is open.
+        // An aborted transaction rejects the query; report unknown so closing still asks.
         // A bare string has no arguments, so it uses the simple protocol; the extended one sends Parse and Execute
         // separately, which moves statement_timestamp() even outside a transaction.
         SessionConn::Pg(c) => (&mut *c)
             .fetch_one("SELECT transaction_timestamp() <> statement_timestamp()")
             .await
             .and_then(|row| row.try_get::<bool, _>(0))
-            .unwrap_or(true),
+            .ok(),
         // MariaDB exposes @@in_transaction; MySQL needs InnoDB's view, which may require
-        // the PROCESS privilege. Unknown states are reported as no open transaction.
+        // the PROCESS privilege. Preserve unknown states so closing cannot silently discard work.
         SessionConn::My(c) => {
             if let Ok(v) = sqlx::query_scalar::<_, i64>("SELECT CAST(@@in_transaction AS SIGNED)")
                 .fetch_one(&mut *c)
                 .await
             {
-                return v != 0;
+                return Some(v != 0);
             }
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM information_schema.innodb_trx WHERE trx_mysql_thread_id = CONNECTION_ID()")
                 .fetch_one(&mut *c)
                 .await
                 .map(|n| n > 0)
-                .unwrap_or(false)
+                .ok()
         }
     }
 }
@@ -582,23 +606,23 @@ async fn dbde_session_in_transaction(
     connection_id: String,
     session_id: String,
     state: State<'_, AppState>,
-) -> DbResult<bool> {
+) -> DbResult<Option<bool>> {
     let Ok(conn) = connection(&state, &connection_id).await else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     let Some(slot) = session_slot(&conn, &session_id).await else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     let check = async {
         match slot.session.lock().await.as_mut() {
             Some(session) => session_in_transaction(session).await,
-            None => false,
+            None => Some(false),
         }
     };
-    // A busy session cannot be inspected quickly; assume work may be pending.
+    // A busy session cannot be inspected quickly; do not claim a known transaction state.
     Ok(tokio::time::timeout(Duration::from_secs(5), check)
         .await
-        .unwrap_or(true))
+        .unwrap_or(None))
 }
 #[tauri::command]
 async fn dbde_close_session(
@@ -919,7 +943,11 @@ async fn open_session(conn: &Connection) -> DbResult<(SessionConn, u64)> {
             )
             .await
             .map_err(|_| "Connection timeout while opening the query session.".to_string())?
-            .map_err(err)?;
+            .map_err(|cause| {
+                conn.tunnel
+                    .as_ref()
+                    .map_or_else(|| err(&cause), |t| t.connection_error(&cause))
+            })?;
             if !conn.config.options.initial_queries.trim().is_empty() {
                 (&mut c)
                     .execute(conn.config.options.initial_queries.as_str())
@@ -939,7 +967,11 @@ async fn open_session(conn: &Connection) -> DbResult<(SessionConn, u64)> {
             )
             .await
             .map_err(|_| "Connection timeout while opening the query session.".to_string())?
-            .map_err(err)?;
+            .map_err(|cause| {
+                conn.tunnel
+                    .as_ref()
+                    .map_or_else(|| err(&cause), |t| t.connection_error(&cause))
+            })?;
             if !conn.config.options.initial_queries.trim().is_empty() {
                 (&mut c)
                     .execute(conn.config.options.initial_queries.as_str())
@@ -1002,9 +1034,30 @@ async fn session_query(conn: &Connection, session_id: &str, query: &str) -> DbRe
             Session {
                 conn: session_conn,
                 database: conn.config.database.clone(),
+                last_used: Instant::now(),
             }
         }
     };
+    // Probe idle sessions before sending SQL. A restored session loses temporary
+    // objects, session variables and transactions, so require review before running
+    // the user's next statement rather than silently continuing on a new session.
+    if session.last_used.elapsed() >= Duration::from_secs(30) && !session_alive(&mut session).await
+    {
+        *slot.server_id.lock().map_err(err)? = None;
+        close_session(session).await;
+        let (session_conn, server_id) = open_session(conn).await.map_err(|cause| {
+            conn.tunnel
+                .as_ref()
+                .map_or_else(|| cause.clone(), |t| t.connection_error(&cause))
+        })?;
+        *slot.server_id.lock().map_err(err)? = Some(server_id);
+        *guard = Some(Session {
+            conn: session_conn,
+            database: conn.config.database.clone(),
+            last_used: Instant::now(),
+        });
+        return Err("The idle database session disconnected and has been restored. This command was not run. Previous transactions, temporary tables and session settings were lost; review them before running again. You do not need to disconnect the connection.".into());
+    }
     // A failed statement must keep the session: MySQL transactions survive errors.
     let result = async {
         match &mut session.conn {
@@ -1014,12 +1067,14 @@ async fn session_query(conn: &Connection, session_id: &str, query: &str) -> DbRe
     }
     .await;
     if result.is_ok() || session_alive(&mut session).await {
+        session.last_used = Instant::now();
         *guard = Some(session);
     } else {
         if let Ok(mut id) = slot.server_id.lock() {
             *id = None;
         }
         close_session(session).await;
+        return result.map_err(|cause| format!("The database connection was lost while waiting for the result. The command was not retried and may have committed; refresh and verify data before retrying. {cause}"));
     }
     result
 }
@@ -1059,19 +1114,27 @@ async fn dbde_execute_query(
     match tokio::time::timeout(Duration::from_secs(seconds), run).await {
         Ok(result) => result,
         Err(_) => {
-            let Some(session_id) = session_id else {
-                return Err(format!("Query timed out after {seconds} seconds. A write may have committed; verify database state before retrying."));
-            };
+            let mut cancelled = false;
             // Dropping the client side does not stop the server, so cancel it there too.
-            if let Some(slot) = session_slot(&conn, &session_id).await {
-                let server_id = slot.server_id.lock().ok().and_then(|mut id| id.take());
-                if let Some(server_id) = server_id {
-                    let _ = timed(cancel_server_query(&conn, server_id)).await;
+            if let Some(session_id) = session_id {
+                if let Some(slot) = session_slot(&conn, &session_id).await {
+                    let server_id = slot.server_id.lock().ok().and_then(|mut id| id.take());
+                    if let Some(server_id) = server_id {
+                        cancelled = timed(cancel_server_query(&conn, server_id)).await.is_ok();
+                    }
                 }
             }
-            Err(format!("Query timed out after {seconds} seconds and was cancelled on the server. This tab's session was reset, so any open transaction was rolled back."))
+            Err(timeout_message("Query", seconds, cancelled))
         }
     }
+}
+fn timeout_message(operation: &str, seconds: u64, cancelled: bool) -> String {
+    let cancellation = if cancelled {
+        "Server cancellation was acknowledged."
+    } else {
+        "Server cancellation could not be confirmed."
+    };
+    format!("{operation} timed out after {seconds} seconds. {cancellation} Work may already have committed. Verify database state and transaction status before retrying; rollback is not guaranteed.")
 }
 // SHOW DATABASES can report names as VARBINARY on some MySQL-compatible
 // servers/session collations. These values are metadata text, not record BLOBs.
@@ -1345,6 +1408,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             app.manage(windows::DetachedWindows::default());
+            app.manage(lifecycle::Lifecycle::default());
+            app.manage(operations::Operations::default());
             app.manage(updates::Updates::default());
             app.manage(export::Exports::default());
             app.manage(import::Imports::default());
@@ -1359,6 +1424,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            lifecycle::dbde_finish_close,
+            operations::dbde_cancel_operation,
+            bulk::dbde_read_table_snapshot,
+            bulk::dbde_transfer_records,
             updates::dbde_update_status,
             updates::dbde_check_update,
             updates::dbde_install_update,
@@ -1399,6 +1468,7 @@ pub fn run() {
             objects::dbde_object_action,
             schema::dbde_table_ddl,
             table_actions::dbde_copy_table,
+            batch_copy::dbde_copy_tables,
             table_actions::dbde_clear_table,
             table_actions::dbde_drop_table,
             table_actions::dbde_rename_table,
@@ -1407,6 +1477,7 @@ pub fn run() {
             database_actions::dbde_manage_database,
             database_actions::dbde_open_sql_file,
             schema::dbde_save_file,
+            export::dbde_dump_sql,
             export::dbde_export_table,
             export::dbde_export_rows,
             export::dbde_cancel_export,
@@ -1425,8 +1496,34 @@ pub fn run() {
             query_library::dbde_library_save,
             query_library::dbde_library_delete
         ])
-        .run(tauri::generate_context!())
-        .expect("Failed to start DBde");
+        .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::CloseRequested { .. })
+                && !window
+                    .state::<lifecycle::Lifecycle>()
+                    .0
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                }
+                lifecycle::request(window.app_handle());
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("Failed to start DBde")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if !app
+                    .state::<lifecycle::Lifecycle>()
+                    .0
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    api.prevent_exit();
+                    lifecycle::request(app);
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1574,6 +1671,36 @@ mod tests {
             databases: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+    #[tokio::test]
+    #[ignore = "requires disposable DBDE_TEST_MYSQL_URL; kills only this test's own query session"]
+    async fn mysql_idle_session_recovers_without_replaying_the_pending_command() {
+        let conn = server_connection("DBDE_TEST_MYSQL_URL", Driver::Mysql).await;
+        session_query(&conn, "idle-test", "BEGIN").await.unwrap();
+        let slot = session_slot(&conn, "idle-test").await.unwrap();
+        let original = slot.server_id.lock().unwrap().unwrap();
+        query(&conn.pool, &format!("KILL CONNECTION {original}"))
+            .await
+            .unwrap();
+        slot.session.lock().await.as_mut().unwrap().last_used =
+            Instant::now() - Duration::from_secs(31);
+        let restored = session_query(&conn, "idle-test", "SET @dbde_sent_after_idle = 123")
+            .await
+            .err()
+            .expect("An idle session reset must stop the pending command");
+        assert!(restored.contains("has been restored"), "{restored}");
+        assert!(restored.contains("command was not run"));
+        assert_ne!(slot.server_id.lock().unwrap().unwrap(), original);
+        let result = session_query(&conn, "idle-test", "SELECT @dbde_sent_after_idle")
+            .await
+            .unwrap();
+        assert_eq!(result.rows, vec![vec![Value::Null]]);
+        assert_eq!(
+            session_in_transaction(slot.session.lock().await.as_mut().unwrap()).await,
+            Some(false)
+        );
+        close_session(slot.session.lock().await.take().unwrap()).await;
+        close(conn.pool).await;
     }
     async fn query_tabs_keep_their_own_session(conn: Connection, temp: &str) {
         let setup = format!("CREATE {temp} TABLE dbde_session (x INT); INSERT INTO dbde_session VALUES (1), (2); SELECT COUNT(*) AS n FROM dbde_session");
@@ -1725,11 +1852,14 @@ mod tests {
         assert_eq!(after.rows, vec![vec![json!(2)]]);
         let mut guard = slot.session.lock().await;
         let session = guard.as_mut().unwrap();
-        assert!(!session_in_transaction(session).await);
+        assert_eq!(session_in_transaction(session).await, Some(false));
         drop(guard);
         session_query(&conn, "tab-c", "BEGIN").await.unwrap();
         let mut guard = slot.session.lock().await;
-        assert!(session_in_transaction(guard.as_mut().unwrap()).await);
+        assert_eq!(
+            session_in_transaction(guard.as_mut().unwrap()).await,
+            Some(true)
+        );
         drop(guard);
         session_query(&conn, "tab-c", "ROLLBACK").await.unwrap();
     }
@@ -2252,5 +2382,27 @@ mod tests {
             safe_error("failed top-secret", "top-secret"),
             "failed [redacted]"
         );
+    }
+}
+
+#[cfg(test)]
+mod timeout_feedback_tests {
+    use super::timeout_message;
+
+    #[test]
+    fn timeout_does_not_promise_rollback_even_when_cancellation_is_acknowledged() {
+        for operation in ["Query", "Explain", "Maintenance"] {
+            for cancelled in [false, true] {
+                let message = timeout_message(operation, 30, cancelled);
+                assert!(message.contains("Work may already have committed"));
+                assert!(message.contains("rollback is not guaranteed"));
+                assert!(!message.contains("was rolled back"));
+                assert_eq!(message.contains("cancellation was acknowledged"), cancelled);
+                assert_eq!(
+                    message.contains("cancellation could not be confirmed"),
+                    !cancelled
+                );
+            }
+        }
     }
 }

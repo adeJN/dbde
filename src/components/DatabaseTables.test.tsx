@@ -34,6 +34,37 @@ const session: Session = {
   },
   trees: { shop: { database: "shop", tables } },
 };
+it("deletes selected tables through the toolbar, keyboard and context menu", async () => {
+  const onDelete = vi.fn();
+  render(
+    <DatabaseTables
+      session={session}
+      database="shop"
+      loadSchema={vi.fn()}
+      onOpen={vi.fn()}
+      onCreate={vi.fn()}
+      onAction={vi.fn()}
+      onDelete={onDelete}
+    />,
+  );
+  fireEvent.click(screen.getByRole("button", { name: "alpha" }));
+  fireEvent.click(screen.getByRole("button", { name: "beta" }), {
+    metaKey: true,
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Delete selected tables" }),
+  );
+  expect(onDelete).toHaveBeenLastCalledWith(tables.slice(0, 2));
+  fireEvent.keyDown(screen.getByRole("button", { name: "beta" }), {
+    key: "Delete",
+  });
+  expect(onDelete).toHaveBeenLastCalledWith(tables.slice(0, 2));
+  fireEvent.contextMenu(screen.getByRole("button", { name: "beta" }));
+  fireEvent.click(
+    await screen.findByRole("menuitem", { name: "Delete 2 selected tables…" }),
+  );
+  expect(onDelete).toHaveBeenLastCalledWith(tables.slice(0, 2));
+});
 it("selects with clicks/arrows, copies a range, pastes, and opens with Enter or double-click", async () => {
   const onOpen = vi.fn(),
     onCopy = vi.fn(),

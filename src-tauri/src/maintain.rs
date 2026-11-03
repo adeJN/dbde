@@ -345,10 +345,11 @@ pub(crate) async fn dbde_maintain_tables(
         Err(_) => {
             // The dedicated connection is dropped with the future; stop the server side too.
             let id = server_id.lock().ok().and_then(|mut id| id.take());
-            if let Some(id) = id {
-                let _ = timed(cancel_server_query(&conn, id)).await;
-            }
-            Err(format!("Maintenance timed out after {seconds} seconds and was cancelled on the server. Tables already processed keep their results."))
+            let cancelled = match id {
+                Some(id) => timed(cancel_server_query(&conn, id)).await.is_ok(),
+                None => false,
+            };
+            Err(timeout_message("Maintenance", seconds, cancelled))
         }
     }
 }

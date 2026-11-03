@@ -167,7 +167,7 @@ pub(crate) async fn table_ddl(
             .fetch_one(p)
             .await
             .map_err(err)?;
-            let ddl: String = row.try_get(1).map_err(err)?;
+            let ddl = mysql_metadata_text(&row, 1)?;
             Ok(format!("{ddl};"))
         }
         Pool::Lite(p) => {
